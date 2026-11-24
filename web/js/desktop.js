@@ -1,5 +1,5 @@
-// On your own Windows PC (the launcher, start.ps1, started this Freefield), a card asks once whether to put a
-// Freefield icon on the desktop. The server keeps the answer in the volume, and the launcher's window, still open on
+// On your own Windows PC (the launcher, start.ps1, started this SPACIX), a card asks once whether to put a
+// SPACIX icon on the desktop. The server keeps the answer in the volume, and the launcher's window, still open on
 // Windows, makes the icon (server/desktop.ts). /api/gpu carries the state; it is null where there is no launcher:
 // RunPod, Vast.ai, the hosted demo.
 import { el, api, toast, logoMark } from "./util.js";

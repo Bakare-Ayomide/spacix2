@@ -131,7 +131,7 @@ export function waveform(url) {
       const data = audio.getChannelData(0);
       const g = canvas.getContext("2d");
       const bars = 96, step = Math.floor(data.length / bars), w = canvas.width / bars;
-      g.fillStyle = "#e8ff5a";
+      g.fillStyle = "#38bdf8";
       for (let b = 0; b < bars; b++) {
         let peak = 0;
         for (let i = b * step; i < (b + 1) * step; i += 64) peak = Math.max(peak, Math.abs(data[i] || 0));
@@ -147,5 +147,5 @@ export function waveform(url) {
 /** File name for a download link. */
 export function downloadName(item, url) {
   const ext = extOf(url) || (item.type === "video" ? "mp4" : item.type === "audio" ? "mp3" : "png");
-  return `freefield-${item.app}-${item.kind === "history" ? item.id : "example"}.${ext}`;
+  return `spacix-${item.app}-${item.kind === "history" ? item.id : "example"}.${ext}`;
 }

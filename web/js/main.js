@@ -49,7 +49,7 @@ function render({ keepScroll = false } = {}) {
   bar?.update(view.active);
   if (!keepScroll) window.scrollTo(0, 0);
   const app = view.app;
-  document.title = app ? `${app.name} · Freefield` : "Freefield";
+  document.title = app ? `${app.name} · SPACIX` : "SPACIX";
 }
 
 const strip = modelsStrip();   // under the top bar: a download on its way, apps waiting for a license

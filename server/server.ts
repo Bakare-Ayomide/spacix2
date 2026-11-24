@@ -507,7 +507,7 @@ const server = createServer(async (req, res) => {
         if (!app?.workflowPath) return send(res, 404, { error: "no workflow" });
         const body = readFileSync(app.workflowPath);
         res.writeHead(200, { "content-type": "application/json; charset=utf-8", "content-length": body.byteLength, "cache-control": "no-cache",
-          "content-disposition": `attachment; filename="freefield-${app.id}.json"` });
+          "content-disposition": `attachment; filename="spacix-${app.id}.json"` });
         return res.end(body);
       }
       if (req.method === "POST" && area === "apps" && sub === "run") {
@@ -579,7 +579,7 @@ const server = createServer(async (req, res) => {
         if (id === "token" && req.method === "PUT") {
           // a token is a password to the owner's Hugging Face account: not over plain http to a bare IP (a Vast.ai port)
           if (plainHttpToIp(req)) {
-            return send(res, 400, { error: "open Freefield through its https link to paste a token (it is in the log, the line with trycloudflare.com): over plain http, anyone on the way could read it" });
+            return send(res, 400, { error: "open SPACIX through its https link to paste a token (it is in the log, the line with trycloudflare.com): over plain http, anyone on the way could read it" });
           }
           const body = await (await toRequest(req)).json().catch(() => null) as { token?: unknown } | null;
           if (!body || typeof body.token !== "string") throw new InputError('expected JSON { "token": "hf_..." }');
@@ -647,5 +647,5 @@ const server = createServer(async (req, res) => {
 // runs that were still going when the server stopped are followed again
 if (!demoMode) history.resume(async (jobId) => getRunner().jobs().get(jobId));
 
-server.listen(port, host, () => console.log(`freefield on http://${host}:${port} (${apps.length} apps${demoMode ? " · preview mode" : ""})`
+server.listen(port, host, () => console.log(`spacix on http://${host}:${port} (${apps.length} apps${demoMode ? " · preview mode" : ""})`
   + (guard.passcode ? " · passcode required" : "") + (guard.maxRunsPerDay ? ` · ${guard.maxRunsPerDay} runs a day` : "")));

@@ -206,14 +206,14 @@ function same(a: string, b: string): boolean {
 
 /** The page a visitor without the cookie gets: one field for the passcode. */
 export const DOOR_HTML = `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Freefield</title>
-<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect x='1' y='1' width='30' height='30' rx='9' fill='%23e8ff5a'/%3E%3Cpath d='M8 11.5h16M8 16.5h9M8 21.5h12' stroke='%2311140a' stroke-width='3' stroke-linecap='round'/%3E%3Ccircle cx='22.5' cy='16.5' r='1.9' fill='%2311140a'/%3E%3C/svg%3E">
+<title>SPACIX</title>
+<link rel="icon" href="https://spacix.ticketplaster.com/brand/logo.png">
 <style>
 :root{color-scheme:dark}body{margin:0;min-height:100vh;display:grid;place-items:center;background:#09090a;color:#f4f4f2;font:15px/1.5 system-ui,sans-serif}
-form{display:grid;gap:12px;width:min(320px,calc(100vw - 32px))}h1{margin:0;font-size:22px}p{margin:0;color:#9b9ba3}
+form{display:grid;gap:12px;width:min(320px,calc(100vw - 32px))}.door-brand{display:flex;align-items:center;gap:10px}.door-logo{display:block;height:clamp(26px,5vw,36px);width:auto;max-width:160px;object-fit:contain}h1{margin:0;font-size:22px}p{margin:0;color:#9b9ba3}
 input,button{font:inherit;padding:10px 12px;border-radius:8px;border:1px solid #2e2e33;background:#151517;color:inherit}
-button{background:#e8ff5a;color:#11140a;border:0;font-weight:600;cursor:pointer}</style></head>
-<body><form method="get" action="/"><h1>Freefield</h1><p>This demo is private. Enter the passcode you were given.</p>
+button{background:#38bdf8;color:#06131f;border:0;font-weight:600;cursor:pointer}button:hover{background:#7dd3fc}</style></head>
+<body><form method="get" action="/"><div class="door-brand"><img class="door-logo" src="https://spacix.ticketplaster.com/brand/logo.png" alt="SPACIX"><h1>SPACIX</h1></div><p>This demo is private. Enter the passcode you were given.</p>
 <input name="key" type="password" autocomplete="current-password" aria-label="Passcode" required autofocus><button>Open</button></form></body></html>`;
 
 // Where the owner of a pod or of their own GPU finds the passcode (FREEFIELD_BACKEND_NAME, set by infra/pod.py)
@@ -222,8 +222,8 @@ const WHERE: Record<string, { en: string; es: string }> = {
     es: "Está en el log del pod en RunPod (Logs), en la línea que empieza con Passcode, y en el link de arriba de esa línea." },
   "Vast.ai": { en: "It is in the instance's log on Vast.ai, on the line that starts with Passcode, and in the link above it.",
     es: "Está en el log de la instancia en Vast.ai, en la línea que empieza con Passcode, y en el link de arriba de esa línea." },
-  "this computer": { en: "It is in the window of the Freefield launcher, and in the container's log (docker logs freefield).",
-    es: "Está en la ventana del lanzador de Freefield, y en el log del contenedor (docker logs freefield)." },
+  "this computer": { en: "It is in the window of the SPACIX launcher, and in the container's log (docker logs freefield).",
+    es: "Está en la ventana del lanzador de SPACIX, y en el log del contenedor (docker logs freefield)." },
 };
 
 /** The door of a pod or of your own GPU: the same form, and where its owner finds the passcode. */
@@ -231,7 +231,7 @@ export function ownerDoor(backend: string, acceptLanguage = ""): string {
   const where = WHERE[backend];
   if (!where) return DOOR_HTML;
   const es = /^es\b/i.test(acceptLanguage.trim());
-  const text = es ? `Este Freefield es privado. Escribe su passcode. ${where.es}` : `This Freefield is private. Enter its passcode. ${where.en}`;
+  const text = es ? `Este SPACIX es privado. Escribe su passcode. ${where.es}` : `This SPACIX is private. Enter its passcode. ${where.en}`;
   return DOOR_HTML.replace("This demo is private. Enter the passcode you were given.", text)
     .replace('<html lang="en">', `<html lang="${es ? "es" : "en"}">`).replace(">Open</button>", es ? ">Abrir</button>" : ">Open</button>");
 }

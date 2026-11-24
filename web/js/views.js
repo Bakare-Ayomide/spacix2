@@ -1,244 +1,267 @@
-// Top-level pages: Explore (#/), Apps (#/apps), Library (#/library), and VRAM map (#/vram).
+// Top-level pages: Explore, Apps store, Library, and VRAM map.
 import { el, icon, masonry, fmtSeconds } from "./util.js";
 import { t } from "./i18n.js";
-import { apps, byId, CATEGORIES, HERO, START_HERE, hosted, studioOf, tagline, fitOf } from "./catalog.js";
+import {
+  apps, byId, CATEGORIES, START_HERE, HERO, hosted,
+  tagline, estimate, fitOf, iconOf, categoryOf,
+} from "./catalog.js";
 import { exampleItem, thumb, hoverPlay, optionTile } from "./media.js";
-import { feedView, hooks } from "./feed.js";
+import { feedView } from "./feed.js";
+import { openViewer } from "./viewer.js";
 import { flags, flagButton } from "./flags.js";
 import { needTag } from "./models.js";
+import { loadExampleInto } from "./workspace.js";
 
-function exampleCard(app, allItems) {
-  const item = exampleItem(app);
-  if (!item) return null;
-  const media = thumb(item, { play: "hover" });
-  const open = () => hooks.open?.(allItems, item.key);
-  const card = el("div", {
-    class: "m-item",
-    tabindex: "0",
-    role: "button",
-    "aria-label": app.name,
-    onclick: open,
-    onkeydown: (e) => { if (e.key === "Enter") open(); },
-  },
-  media,
-  flagButton(app.id, { mini: true }),
-  el("div", { class: "cap" },
-    el("span", {}, app.name),
-    el("span", { class: "tag dark" }, app.section)));
-  hoverPlay(card, media._video);
-  return card;
+function exampleItemsList() {
+  return apps.map((a) => exampleItem(a)).filter(Boolean);
+}
+
+function gallerySpotlight() {
+  // Showcase apps that have per-option lab examples (e.g. effects, morph, mixed-media)
+  const items = [];
+  for (const app of apps) {
+    const optMap = app.example?.options;
+    if (!optMap) continue;
+    for (const input of app.inputs) {
+      if (!input.gallery || !input.options) continue;
+      const shots = optMap[input.id];
+      if (!shots) continue;
+      for (const opt of input.options) {
+        const shot = shots[String(opt.value)];
+        if (!shot) continue;
+        items.push({ app, input, opt, shot });
+      }
+    }
+  }
+  if (!items.length) return null;
+  const pick = items.slice(0, 12);
+  return el("section", {},
+    el("div", { class: "sec-head" },
+      el("div", {},
+        el("h2", { class: "display" }, byId.get("effects")?.name ?? "Effects"),
+        el("p", {}, t("explore.gallery.sub"))),
+      el("a", { class: "more", href: "#/app/effects" }, t("explore.seeall"), icon("right"))),
+    el("div", { class: "fx-wall" }, ...pick.map(({ app, input, opt, shot }) =>
+      optionTile(opt, shot, {
+        play: "hover",
+        flagKey: flags.key(app.id, input.id, opt.value),
+        onPick: () => { location.hash = `#/app/${app.id}?opt=${encodeURIComponent(`${input.id}:${opt.value}`)}`; },
+      }))));
 }
 
 export function exploreView() {
   const cleanups = [];
-  const page = el("div", { class: "page" });
+  const exItems = exampleItemsList();
+  const byAppEx = new Map(exItems.map((it) => [it.app, it]));
 
-  // Hero carousel
-  const heroApps = HERO.map((id) => byId.get(id)).filter((a) => a?.example?.full);
-  if (heroApps.length) {
-    const row = el("div", { class: "hero-row" }, ...heroApps.map((app) => {
-      const item = exampleItem(app);
-      const media = thumb(item, { play: "hover" });
-      const card = el("a", { class: "hero-card", href: `#/app/${app.id}` },
-        media,
-        el("div", { class: "txt" },
-          el("span", { class: "tag" }, app.name),
-          el("h3", { class: "display" }, tagline(app)),
-          app.summary ? el("p", {}, app.summary) : null));
+  const heroCards = HERO.map((id) => {
+    const app = byId.get(id);
+    const ex = app ? byAppEx.get(app.id) : null;
+    if (!app || !ex) return null;
+    const media = thumb(ex, { play: "hover" });
+    const card = el("a", { class: "hero-card", href: `#/app/${app.id}` },
+      media,
+      el("div", { class: "txt" },
+        el("span", { class: "tag" }, app.section.toUpperCase()),
+        el("h3", { class: "display" }, app.name),
+        el("p", {}, tagline(app))));
+    hoverPlay(card, media._video);
+    return card;
+  }).filter(Boolean);
+
+  const heroRow = el("div", { class: "hero-row" }, ...heroCards);
+  const scrollHero = (dir) => heroRow.scrollBy({ left: dir * Math.max(320, heroRow.clientWidth * 0.72), behavior: "smooth" });
+
+  const startSection = hosted ? el("section", {},
+    el("div", { class: "sec-head" },
+      el("div", {},
+        el("h2", { class: "display" }, t("start.title")),
+        el("p", {}, t("start.sub")))),
+    el("div", { class: "start5" }, ...START_HERE.map((id) => {
+      const app = byId.get(id);
+      const ex = app ? byAppEx.get(id) : null;
+      if (!app || !ex) return null;
+      const media = thumb(ex, { play: "hover" });
+      const est = estimate(app);
+      const card = el("button", {
+        class: "start-card", type: "button",
+        onclick: () => loadExampleInto(app),
+      },
+      media,
+      el("span", { class: "nm" }, app.name),
+      el("span", { class: "dim" }, est ? t("start.secs", { s: est.seconds, gpu: est.gpu }) : tagline(app)));
       hoverPlay(card, media._video);
       return card;
-    }));
-    const scrollBy = (dir) => row.scrollBy({ left: dir * Math.max(320, row.clientWidth * 0.7), behavior: "smooth" });
-    const prev = el("button", { class: "hero-nav prev", type: "button", "aria-label": t("act.prev"), onclick: () => scrollBy(-1) }, icon("chevL"));
-    const next = el("button", { class: "hero-nav next", type: "button", "aria-label": t("act.next"), onclick: () => scrollBy(1) }, icon("chevR"));
-    page.append(el("div", { class: "hero-wrap" }, row, prev, next));
-  }
+    }).filter(Boolean))) : null;
 
-  // Hosted demo "Start here" row
-  if (hosted) {
-    const startApps = START_HERE.map((id) => byId.get(id)).filter((a) => a?.example?.full);
-    if (startApps.length) {
-      page.append(
-        el("div", { class: "sec-head" }, el("div", {}, el("h2", { class: "display" }, t("start.title")), el("p", {}, t("start.sub")))),
-        el("div", { class: "start5" }, ...startApps.map((app) => {
-          const item = exampleItem(app);
-          const media = thumb(item, { play: "hover" });
-          const card = el("button", {
-            class: "start-card",
-            type: "button",
-            onclick: () => hooks.recreate?.(item),
-          },
-          media,
-          el("span", { class: "nm" }, app.name),
-          el("span", { class: "dim" }, item.seconds ? t("start.secs", { s: Math.round(item.seconds), gpu: (item.gpu || "GPU").split(",")[0] }) : tagline(app)));
-          hoverPlay(card, media._video);
-          return card;
-        })),
-      );
-    }
-  }
-
-  // Promo + 6 studio tiles
-  const imageCount = apps.filter((a) => a.section === "image" && studioOf(a) !== "video").length;
-  const videoCount = apps.filter((a) => studioOf(a) === "video").length;
-  const audioCount = apps.filter((a) => a.section === "audio").length;
-  const tiles = [
-    ["image", "#/image", "image", imageCount],
-    ["video", "#/video", "video", videoCount],
-    ["audio", "#/audio", "audio", audioCount],
-    ["apps", "#/apps", "layers", apps.length],
-    ["library", "#/library", "film", null],
-    ["vram", "#/vram", "chip", null],
+  const tiles6Data = [
+    ["#/image", "image", t("tile.image.t"), t("tile.image.d")],
+    ["#/video", "video", t("tile.video.t"), t("tile.video.d")],
+    ["#/audio", "audio", t("tile.audio.t"), t("tile.audio.d")],
+    ["#/apps", "layers", t("tile.apps.t"), t("tile.apps.d")],
+    ["#/library", "film", t("tile.library.t"), t("tile.library.d")],
+    ["#/vram", "chip", t("tile.vram.t"), t("tile.vram.d")],
   ];
-  page.append(el("section", { class: "promo" },
+
+  const promo = el("section", { class: "promo" },
     el("div", { class: "promo-lead" },
-      el("div", { style: { display: "grid", gap: "14px" } },
+      el("div", {},
         el("h2", { class: "display" }, t("explore.lead.a"), " ", el("em", {}, t("explore.lead.b"))),
-        el("p", {}, t("explore.lead.text"))),
+        el("p", { style: { marginTop: "12px" } }, t("explore.lead.text"))),
       el("div", { class: "row" },
         el("a", { class: "btn lime", href: "#/image" }, icon("spark"), t("explore.start")),
-        el("a", { class: "btn ghost", href: "#/apps" }, t("explore.browse")))),
-    el("div", { class: "tiles6" }, ...tiles.map(([key, href, ic, n]) =>
+        el("a", { class: "btn ghost", href: "#/apps" }, t("explore.browse"), " · ", t("explore.apps", { n: apps.length })))),
+    el("div", { class: "tiles6" }, ...tiles6Data.map(([href, ic, title, desc]) =>
       el("a", { class: "tile6", href },
-        el("span", { class: "ic" }, icon(ic)),
-        el("div", { class: "t" }, t(`tile.${key}.t`), n ? el("span", { class: "tag ghost" }, t("explore.apps", { n })) : null),
-        el("p", {}, t(`tile.${key}.d`)))))));
+        el("div", { class: "ic" }, icon(ic)),
+        el("div", { class: "t" }, title),
+        el("p", {}, desc)))));
 
-  // Gallery showcase rows (apps with per-option lab examples: AI Influencer, Effects, Morph, Mixed Media)
-  const galleryOrder = ["ai-influencer", "effects", "morph", "mixed-media"];
-  const galleryApps = galleryOrder.map((id) => byId.get(id)).filter(Boolean);
-  for (const app of galleryApps) {
-    const input = app.inputs.find((i) => i.type === "select" && i.gallery);
-    const shots = input && app.example?.options?.[input.id];
-    if (!input || !shots) continue;
-    const opts = (input.options || []).filter((o) => shots[String(o.value)]);
-    if (!opts.length) continue;
-    page.append(
-      el("div", { class: "sec-head" },
-        el("div", {}, el("h2", { class: "display" }, app.name), el("p", {}, t("explore.gallery.sub"))),
-        el("a", { class: "pill-link", href: `#/app/${app.id}` }, t("apps.try"), icon("chevR"))),
-      el("div", { class: "fx-wall" }, ...opts.slice(0, 12).map((opt) =>
-        optionTile(opt, shots[String(opt.value)], {
-          play: "hover",
-          flagKey: flags.key(app.id, input.id, String(opt.value)),
-          onPick: () => { location.hash = `#/app/${app.id}?${encodeURIComponent(input.id)}=${encodeURIComponent(String(opt.value))}`; },
-        }))));
-  }
-
-  // Made with Freefield (masonry of all lab examples)
-  const withExamples = apps.filter((a) => a.example?.full);
-  const allItems = withExamples.map(exampleItem).filter(Boolean);
-  page.append(el("div", { class: "sec-head" },
-    el("div", {}, el("h2", { class: "display" }, t("explore.made")), el("p", {}, t("explore.made.sub"))),
-    el("a", { class: "more", href: "#/apps" }, t("explore.seeall"), icon("chevR"))));
-
-  if (allItems.length) {
-    const grid = el("div", {});
-    page.append(grid);
-    const nodes = withExamples.map((a) => exampleCard(a, allItems)).filter(Boolean);
-    cleanups.push(masonry(grid, nodes, { min: 240, gap: 12 }));
+  const masonryHost = el("div");
+  if (exItems.length) {
+    const cards = exItems.slice(0, 36).map((item) => {
+      const app = byId.get(item.app);
+      const media = thumb(item, { play: "visible" });
+      const node = el("div", {
+        class: "m-item", tabindex: "0", role: "button",
+        "aria-label": app?.name ?? item.app,
+        onclick: () => openViewer(exItems, item.key),
+        onkeydown: (e) => { if (e.key === "Enter") openViewer(exItems, item.key); },
+      },
+      media,
+      flagButton(flags.key(item.app), { mini: true }),
+      el("div", { class: "cap" },
+        el("span", {}, app?.name ?? item.app),
+        el("span", { class: "tag dark" }, item.type)));
+      return node;
+    });
+    masonry(masonryHost, cards, { min: 240, gap: 12 });
+    cleanups.push(() => masonryHost._ro?.disconnect());
   } else {
-    page.append(el("div", { class: "empty" }, t("explore.noex")));
+    masonryHost.append(el("div", { class: "empty" }, t("explore.noex"), " ", el("code", {}, "python lab/publish.py")));
   }
 
-  // How it works
-  page.append(
+  const madeSection = el("section", {},
+    el("div", { class: "sec-head" },
+      el("div", {},
+        el("h2", { class: "display" }, t("explore.made")),
+        el("p", {}, t("explore.made.sub"))),
+      el("a", { class: "more", href: "#/apps" }, t("explore.seeall"), icon("right"))),
+    masonryHost);
+
+  const howSection = el("section", {},
     el("div", { class: "sec-head" }, el("h2", { class: "display" }, t("explore.how"))),
     el("div", { class: "how" },
-      ...[1, 2, 3].map((n) => el("div", {},
-        el("div", { class: "n" }, `0${n}`),
-        el("h3", {}, t(`how.${n}.t`)),
-        el("p", {}, t(`how.${n}.d`))))));
+      el("div", {}, el("div", { class: "n" }, "01"), el("h3", {}, t("how.1.t")), el("p", {}, t("how.1.d"))),
+      el("div", {}, el("div", { class: "n" }, "02"), el("h3", {}, t("how.2.t")), el("p", {}, t("how.2.d"))),
+      el("div", {}, el("div", { class: "n" }, "03"), el("h3", {}, t("how.3.t")), el("p", {}, t("how.3.d")))));
 
-  return { node: page, dispose: () => cleanups.forEach((fn) => fn?.()), active: "explore" };
+  const page = el("div", { class: "page" },
+    startSection,
+    heroCards.length ? el("section", { class: "hero-wrap" },
+      heroRow,
+      el("button", { class: "hero-nav prev", type: "button", "aria-label": t("act.prev"), onclick: () => scrollHero(-1) }, icon("left")),
+      el("button", { class: "hero-nav next", type: "button", "aria-label": t("act.next"), onclick: () => scrollHero(1) }, icon("right"))) : null,
+    promo,
+    gallerySpotlight(),
+    madeSection,
+    howSection);
+
+  return { node: page, active: "explore", dispose: () => cleanups.forEach((fn) => fn()) };
 }
 
 export function appsView() {
-  let activeCat = "all";
+  let selectedCat = "all";
   let query = "";
 
-  const page = el("div", { class: "page" });
-  const searchInput = el("input", { type: "search", placeholder: t("apps.search"), "aria-label": t("apps.search") });
-  const pills = el("div", { class: "pills" });
-  const body = el("div", {});
+  const qParam = /\?cat=([\w-]+)/.exec(location.hash);
+  if (qParam) selectedCat = qParam[1];
 
-  const cats = [{ id: "all" }, ...CATEGORIES];
-  const listedIds = new Set(CATEGORIES.flatMap((c) => c.apps));
-  const extraApps = apps.filter((a) => !listedIds.has(a.id));
-  if (extraApps.length) cats.push({ id: "more", apps: extraApps.map((a) => a.id) });
+  const searchInput = el("input", {
+    type: "search", placeholder: t("apps.search"), "aria-label": t("apps.search"),
+    oninput: () => { query = searchInput.value.trim().toLowerCase(); drawGrid(); },
+  });
+
+  const catIds = ["all", ...CATEGORIES.map((c) => c.id)];
+  const hasMore = apps.some((a) => categoryOf(a.id) === "more");
+  if (hasMore) catIds.push("more");
+
+  const pills = el("div", { class: "pills" });
+  const body = el("div");
+
+  function drawPills() {
+    pills.replaceChildren(...catIds.map((id) =>
+      el("button", {
+        type: "button", "aria-pressed": String(selectedCat === id),
+        onclick: () => { selectedCat = id; drawPills(); drawGrid(); },
+      }, id === "all" ? t("apps.all") : t(`cat.${id}.t`))));
+  }
 
   function appCard(app) {
-    const item = exampleItem(app);
-    const media = item ? thumb(item, { play: "hover" }) : el("div", { class: "media" }, el("span", { class: "placeholder" }, icon(app.section === "video" ? "video" : app.section === "audio" ? "audio" : "image")));
-    const badges = [];
-    if (app.status === "draft") badges.push(el("span", { class: "tag dark" }, t("tag.draft")));
-    const need = needTag(app);
-    if (need) badges.push(need);
-    if (badges.length) media.append(el("div", { class: "badges top" }, ...badges));
+    const ex = exampleItem(app);
+    const media = ex
+      ? thumb(ex, { play: "hover" })
+      : el("div", { class: "media" }, el("span", { class: "placeholder" }, icon(iconOf(app))));
+    const tag = needTag(app) || (app.status === "draft" ? el("span", { class: "tag ghost" }, t("tag.draft")) : null);
+    if (tag) media.append(el("div", { class: "badges top" }, tag));
     const card = el("a", { class: "app-card", href: `#/app/${app.id}` },
       media,
       el("h3", {}, app.name),
-      el("p", {}, tagline(app)),
+      el("p", {}, app.summary || tagline(app)),
       el("span", { class: "btn" }, t("apps.try")));
     hoverPlay(card, media._video);
     return card;
   }
 
-  function drawPills() {
-    pills.replaceChildren(...cats.map((c) => el("button", {
-      type: "button",
-      "aria-pressed": String(activeCat === c.id),
-      onclick: () => { activeCat = c.id; drawPills(); drawBody(); },
-    }, c.id === "all" ? t("apps.all") : t(`cat.${c.id}.t`))));
-  }
+  function drawGrid() {
+    const matches = (a) => {
+      if (!query) return true;
+      const hay = `${a.id} ${a.name} ${a.summary} ${a.higgsfield_feature ?? ""} ${tagline(a)}`.toLowerCase();
+      return hay.includes(query);
+    };
 
-  function drawBody() {
-    const q = query.trim().toLowerCase();
-    const matches = (a) => !q || a.name.toLowerCase().includes(q) || a.id.toLowerCase().includes(q)
-      || (a.summary || "").toLowerCase().includes(q) || tagline(a).toLowerCase().includes(q)
-      || (a.higgsfield_feature || "").toLowerCase().includes(q);
-
-    if (q) {
-      const hits = apps.filter(matches);
-      if (!hits.length) {
-        body.replaceChildren(el("div", { class: "empty" }, t("apps.none", { q: query.trim() })));
-        return;
+    const groups = [];
+    if (selectedCat === "all") {
+      for (const c of CATEGORIES) {
+        const list = c.apps.map((id) => byId.get(id)).filter((a) => a && matches(a));
+        if (list.length) groups.push({ id: c.id, list });
       }
-      body.replaceChildren(el("div", { class: "app-row", style: { marginTop: "20px" } }, ...hits.map(appCard)));
+      const listed = new Set(CATEGORIES.flatMap((c) => c.apps));
+      const rest = apps.filter((a) => !listed.has(a.id) && matches(a));
+      if (rest.length) groups.push({ id: "more", list: rest });
+    } else {
+      const list = apps.filter((a) => categoryOf(a.id) === selectedCat && matches(a));
+      if (list.length) groups.push({ id: selectedCat, list });
+    }
+
+    if (!groups.length) {
+      body.replaceChildren(el("div", { class: "empty" }, t("apps.none", { q: searchInput.value.trim() })));
       return;
     }
 
-    const sections = [];
-    for (const c of cats) {
-      if (c.id === "all") continue;
-      if (activeCat !== "all" && activeCat !== c.id) continue;
-      const groupApps = (c.apps || []).map((id) => byId.get(id)).filter(Boolean);
-      if (!groupApps.length) continue;
-      sections.push(
-        el("div", { class: "sec-head" },
-          el("div", {}, el("h2", { class: "display" }, t(`cat.${c.id}.t`)), t(`cat.${c.id}.d`) ? el("p", {}, t(`cat.${c.id}.d`)) : null),
-          activeCat === "all" ? el("button", {
-            class: "more",
-            type: "button",
-            style: { border: 0, background: "none", cursor: "pointer" },
-            onclick: () => { activeCat = c.id; drawPills(); drawBody(); window.scrollTo(0, 0); },
-          }, t("apps.seeall"), icon("chevR")) : null),
-        el("div", { class: "app-row" }, ...groupApps.map(appCard)));
-    }
-    body.replaceChildren(...sections);
+    body.replaceChildren(...groups.map((g) => el("section", {},
+      el("div", { class: "sec-head" },
+        el("div", {},
+          el("h2", { class: "display" }, t(`cat.${g.id}.t`)),
+          t(`cat.${g.id}.d`) ? el("p", {}, t(`cat.${g.id}.d`)) : null),
+        selectedCat === "all" ? null : el("button", {
+          class: "more", type: "button",
+          style: { border: 0, background: "none", cursor: "pointer" },
+          onclick: () => { selectedCat = "all"; drawPills(); drawGrid(); },
+        }, t("apps.seeall"))),
+      el("div", { class: "app-row" }, ...g.list.map(appCard)))));
   }
 
-  searchInput.addEventListener("input", () => { query = searchInput.value; drawBody(); });
   drawPills();
-  drawBody();
+  drawGrid();
 
-  page.append(
+  const page = el("div", { class: "page" },
     el("div", { class: "apps-head" },
       el("h1", { class: "display" }, t("apps.title.a"), " ", el("em", {}, t("apps.title.b"))),
       el("p", {}, t("apps.sub")),
       el("div", { class: "apps-bar" },
         pills,
-        el("label", { class: "search" }, icon("search"), searchInput))),
+        el("div", { class: "search" }, icon("search"), searchInput))),
     body);
 
   return { node: page, active: "apps" };
@@ -246,115 +269,151 @@ export function appsView() {
 
 export function libraryView() {
   let tab = "mine";
-  let labFilter = "all";
-  let disposeInner = null;
-
-  const page = el("div", { class: "page" });
-  const tabsBar = el("div", { class: "tabs" });
-  const content = el("div", { style: { marginTop: "20px" } });
+  let filterApp = "";
+  let stopFeed = null;
+  let offFlags = null;
+  const host = el("div");
+  const tabsEl = el("div", { class: "tabs" });
+  const appSelect = el("select", {
+    "aria-label": t("lib.allapps"),
+    style: {
+      height: "36px", padding: "0 12px", borderRadius: "10px",
+      background: "var(--panel)", border: "1px solid var(--line-2)", color: "var(--ink)", font: "inherit",
+    },
+    onchange: () => { filterApp = appSelect.value; drawBody(); },
+  }, el("option", { value: "" }, t("lib.allapps")), ...apps.map((a) => el("option", { value: a.id }, a.name)));
 
   function drawTabs() {
-    tabsBar.replaceChildren(
-      ...[["mine", t("lib.mine")], ["lab", t("lib.lab")]].map(([id, label]) =>
-        el("button", { type: "button", "aria-selected": String(tab === id), onclick: () => { tab = id; drawTabs(); drawContent(); } }, label)));
+    const items = [
+      ["mine", t("lib.mine")],
+      ["lab", t("lib.lab")],
+    ];
+    if (!hosted && flags.count() > 0) items.push(["flagged", t("lib.flagged", { n: flags.count() })]);
+    else if (tab === "flagged") tab = "mine";
+    tabsEl.replaceChildren(...items.map(([id, label]) =>
+      el("button", {
+        type: "button", "aria-selected": String(tab === id),
+        onclick: () => { tab = id; drawTabs(); drawBody(); },
+      }, label)));
   }
 
-  function drawContent() {
-    disposeInner?.();
-    disposeInner = null;
+  function drawBody() {
+    stopFeed?.();
+    stopFeed = null;
+    host._ro?.disconnect();
+    appSelect.hidden = tab === "flagged";
+
     if (tab === "mine") {
-      const host = el("div", {});
-      content.replaceChildren(host);
-      disposeInner = feedView(host, {
-        empty: () => el("div", { class: "empty" }, t("lib.empty")),
+      stopFeed = feedView(host, {
+        app: filterApp || null,
+        empty: el("div", { class: "empty" }, t("lib.empty")),
       });
       return;
     }
 
-    const wrap = el("div", { style: { display: "grid", gap: "14px" } });
-    const bar = el("div", { class: "pills" });
-    const grid = el("div", {});
-    let disposeGrid = null;
-
-    const renderLab = () => {
-      disposeGrid?.();
-      const flagCount = flags.count();
-      bar.replaceChildren(
-        el("button", { type: "button", "aria-pressed": String(labFilter === "all"), onclick: () => { labFilter = "all"; renderLab(); } }, t("lib.allex")),
-        !hosted ? el("button", { type: "button", "aria-pressed": String(labFilter === "flagged"), onclick: () => { labFilter = "flagged"; renderLab(); } }, t("lib.flagged", { n: flagCount })) : null,
-      );
-      const listApps = apps.filter((a) => a.example?.full && (labFilter === "all" || flags.is(a.id)));
-      const allItems = listApps.map(exampleItem).filter(Boolean);
-      if (!allItems.length) {
-        grid.replaceChildren(el("div", { class: "empty" }, labFilter === "flagged" ? t("lib.noflag") : t("explore.noex")));
+    if (tab === "lab") {
+      const items = exampleItemsList().filter((it) => !filterApp || it.app === filterApp);
+      if (!items.length) {
+        host.replaceChildren(el("div", { class: "empty" }, t("explore.noex")));
         return;
       }
-      const nodes = listApps.map((a) => exampleCard(a, allItems)).filter(Boolean);
-      disposeGrid = masonry(grid, nodes, { min: 240, gap: 12 });
-    };
+      const cards = items.map((item) => {
+        const app = byId.get(item.app);
+        const media = thumb(item, { play: "visible" });
+        return el("div", {
+          class: "m-item", tabindex: "0", role: "button",
+          onclick: () => openViewer(items, item.key),
+          onkeydown: (e) => { if (e.key === "Enter") openViewer(items, item.key); },
+        },
+        media,
+        flagButton(flags.key(item.app), { mini: true }),
+        el("div", { class: "cap" },
+          el("span", {}, app?.name ?? item.app),
+          el("span", { class: "tag dark" }, item.type)));
+      });
+      masonry(host, cards, { min: 250, gap: 12 });
+      return;
+    }
 
-    const offFlags = flags.on(renderLab);
-    renderLab();
-    wrap.append(bar, grid);
-    content.replaceChildren(wrap);
-    disposeInner = () => { offFlags(); disposeGrid?.(); };
+    const keys = flags.keys();
+    if (!keys.length) {
+      host.replaceChildren(el("div", { class: "empty" }, t("lib.noflag")));
+      return;
+    }
+    host.replaceChildren(el("div", { class: "vtable", style: { marginTop: "14px" } }, ...keys.map((key) => {
+      const [appId, inputId, val] = key.split("/");
+      const app = byId.get(appId);
+      return el("div", { class: "vrow", style: { gridTemplateColumns: "1fr auto" } },
+        el("a", { href: `#/app/${appId}`, class: "nm" },
+          el("b", {}, app?.name ?? appId),
+          el("small", {}, inputId ? `${inputId}: ${val}` : t("view.example"))),
+        flagButton(key));
+    })));
   }
 
+  offFlags = flags.on(() => {
+    drawTabs();
+    if (tab === "flagged") drawBody();
+  });
   drawTabs();
-  drawContent();
-  page.append(
-    el("div", { class: "apps-head" },
-      el("h1", { class: "display" }, t("lib.title")),
-      el("p", {}, t("lib.sub")),
-      tabsBar),
-    content);
+  drawBody();
 
-  return { node: page, dispose: () => disposeInner?.(), active: "library" };
+  const page = el("div", { class: "page" },
+    el("div", { class: "sec-head", style: { marginTop: "8px" } },
+      el("div", {},
+        el("h1", { class: "display", style: { margin: 0, fontSize: "clamp(28px, 3.6vw, 44px)" } }, t("lib.title")),
+        el("p", {}, t("lib.sub")))),
+    el("div", { style: { display: "flex", gap: "10px", alignItems: "center", justifyContent: "space-between", flexWrap: "wrap", marginBottom: "16px" } },
+      tabsEl, appSelect),
+    host);
+
+  return {
+    node: page,
+    active: "library",
+    dispose: () => { stopFeed?.(); offFlags?.(); host._ro?.disconnect(); },
+  };
 }
 
 export function vramView(gpuData) {
-  const page = el("div", { class: "page" });
-  const rows = apps.filter((a) => a.vram).sort((a, b) => (a.vram.largest_phase_gb ?? 0) - (b.vram.largest_phase_gb ?? 0));
-  const maxGb = Math.max(48, ...rows.map((a) => Math.max(a.vram.whole_gb || 0, a.vram.measured_gb || 0)));
-  const pct = (gb) => `${Math.min(100, (gb / maxGb) * 100)}%`;
+  const rows = apps.filter((a) => a.vram).sort((a, b) => (b.vram.largest_phase_gb ?? 0) - (a.vram.largest_phase_gb ?? 0));
+  const maxGb = Math.max(48, ...rows.map((a) => Math.max(a.vram.whole_gb || 0, a.vram.measured_gb || 0, a.vram.largest_phase_gb || 0)));
+  const pct = (gb) => `${Math.min(100, ((gb || 0) / maxGb) * 100).toFixed(2)}%`;
 
-  const liveLine = gpuData?.device?.vram_total_gb
-    ? el("div", { class: "statline" }, el("span", {},
-      t("vram.live", { name: gpuData.device.name || "GPU", used: gpuData.device.vram_used_gb, total: gpuData.device.vram_total_gb })))
+  const scaleMarks = [0, 12, 24, 36, 48].filter((v) => v <= maxGb);
+
+  const liveBanner = gpuData?.device?.vram_total_gb
+    ? el("p", { class: "mcallout", style: { background: "var(--panel)", border: "1px solid var(--line-2)", marginBottom: "14px" } },
+      icon("chip"),
+      t("vram.live", { name: gpuData.device.name || "GPU", used: gpuData.device.vram_used_gb ?? 0, total: gpuData.device.vram_total_gb }))
     : null;
 
-  const legend = el("div", { class: "legend", style: { marginTop: "20px", marginBottom: "14px" } },
-    el("span", {}, el("i", { style: { background: "rgba(255,255,255,.18)" } }), t("vram.whole")),
-    el("span", {}, el("i", { style: { background: "var(--accent)" } }), t("vram.phase")),
-    el("span", {}, el("i", { style: { background: "var(--pink)", width: "4px" } }), t("vram.measured")));
-
-  const ticks = [0, 12, 24, 48, 80].filter((x) => x <= maxGb);
-  const scale = el("div", { class: "vscale" }, ...ticks.map((gb) =>
-    el("span", { style: { left: pct(gb) } }, `${gb} ${t("unit.gb")}`)));
-
-  const table = el("div", { class: "vtable" }, ...rows.map((app) => {
-    const v = app.vram;
-    const fit = fitOf(app);
-    return el("a", { class: "vrow", href: `#/app/${app.id}` },
-      el("div", { class: "nm" }, el("b", {}, app.name), el("small", {}, `${app.pack} · ${v.largest_phase_gb} / ${v.whole_gb} ${t("unit.gb")}`)),
+  const page = el("div", { class: "page" },
+    el("div", { class: "sec-head", style: { marginTop: "8px" } },
       el("div", {},
-        el("div", { class: "vbar", title: `${v.largest_phase_gb} GB phase · ${v.whole_gb} GB whole${v.measured_gb ? ` · ${v.measured_gb} GB peak` : ""}` },
-          el("i", { class: "whole", style: { width: pct(v.whole_gb || 0) } }),
-          el("i", { style: { width: pct(v.largest_phase_gb || 0) } }),
-          v.measured_gb ? el("b", { style: { left: pct(v.measured_gb) } }) : null,
-          el("u", { style: { left: pct(24) } }))),
-      el("div", { style: { textAlign: "right" } },
-        fit ? el("span", { class: `fit ${fit[1]}` }, t(fit[0])) : null));
-  }));
-
-  page.append(
-    el("div", { class: "apps-head" },
-      el("h1", { class: "display" }, t("vram.title")),
-      el("p", {}, t("vram.sub")),
-      liveLine),
-    legend,
-    el("div", { class: "vrow", style: { background: "transparent", border: 0, cursor: "default", padding: "0 12px" } }, el("div"), scale, el("div")),
-    table);
+        el("h1", { class: "display", style: { margin: 0, fontSize: "clamp(28px, 3.6vw, 44px)" } }, t("vram.title")),
+        el("p", {}, t("vram.sub")))),
+    liveBanner,
+    el("div", { class: "legend", style: { marginBottom: "16px" } },
+      el("span", {}, el("i", { style: { background: "rgba(255, 255, 255, .16)" } }), t("vram.whole")),
+      el("span", {}, el("i", { style: { background: "var(--accent)" } }), t("vram.phase")),
+      el("span", {}, el("i", { style: { background: "var(--pink)" } }), t("vram.measured"))),
+    el("div", { class: "vrow", style: { background: "transparent", border: 0, cursor: "default", padding: "0 12px" } },
+      el("div"),
+      el("div", { class: "vscale" }, ...scaleMarks.map((v) => el("span", { style: { left: pct(v) } }, `${v} ${t("unit.gb")}`))),
+      el("div")),
+    el("div", { class: "vtable" }, ...rows.map((a) => {
+      const fit = fitOf(a);
+      return el("a", { class: "vrow", href: `#/app/${a.id}` },
+        el("div", { class: "nm" },
+          el("b", {}, a.name),
+          el("small", {}, `${a.vram.largest_phase_gb} / ${a.vram.whole_gb} ${t("unit.gb")}${a.vram.measured_gb ? ` · ${a.vram.measured_gb} ${t("unit.gb")}` : ""}`)),
+        el("div", { class: "vbar" },
+          el("i", { class: "whole", style: { width: pct(a.vram.whole_gb) } }),
+          el("i", { style: { width: pct(a.vram.largest_phase_gb) } }),
+          a.vram.measured_gb ? el("b", { style: { left: pct(a.vram.measured_gb) } }) : null,
+          el("u", { style: { left: pct(24) }, title: "24 GB" })),
+        fit ? el("span", { class: `fit ${fit[1]}` }, t(fit[0])) : el("span"));
+    })));
 
   return { node: page, active: "vram" };
 }

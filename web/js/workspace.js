@@ -1,1032 +1,976 @@
-// App workspace (#/app/<id>): builds each app's form from app.json (floating composer or sidebar),
-// shows its History feed, Library lab example, and How it works tab, and handles Recreate / Use in...
-import { el, icon, logoMark, popover, closePopover, toast, fmtShort, fmtSeconds, clamp, isMedia, masonry, store, extOf } from "./util.js";
+// App workspace view: builds forms from app.json, handles uploads/painting/presets, submits runs, and shows history/how-it-works.
+import { el, icon, popover, closePopover, toast, clamp, fmtSeconds } from "./util.js";
 import { t } from "./i18n.js";
-import { apps, byId, VIDEO_TABS, videoTabOf, layoutOf, familyOf, rememberApp, tagline, iconOf, promptInput, estimate, fitOf } from "./catalog.js";
-import { exampleItem, thumb, fullMedia, hoverPlay, optionTile, downloadName } from "./media.js";
-import { feed, feedView, hooks } from "./feed.js";
+import {
+  apps, byId, layoutOf, familyOf, VIDEO_TABS, videoTabOf,
+  tagline, estimate, fitOf, iconOf, promptInput, draftsAllowed,
+} from "./catalog.js";
+import { exampleItem, thumb, hoverPlay, optionTile } from "./media.js";
+import { feed, feedView } from "./feed.js";
 import { openPainter, maskPreview } from "./paint.js";
+import { needNode, models } from "./models.js";
 import { flagButton, flags } from "./flags.js";
-import { needNode } from "./models.js";
 
-// Pending state stashed by recreate() or useIn() when navigating across apps
-let pendingLoad = null;
-let activeController = null;
+const FILE_TYPES = new Set(["image", "video", "audio"]);
+const isFile = (inp) => FILE_TYPES.has(inp.type);
 
-async function urlToFile(url, fallbackName = "input.bin") {
+// Pending state carried across route switches (recreate, useIn, loadExampleInto)
+let pending = null;
+
+async function fetchAsFile(url, name = "input") {
   const res = await fetch(url);
-  if (!res.ok) throw new Error(`Could not load ${url}`);
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
   const blob = await res.blob();
-  const ext = extOf(url);
-  const name = fallbackName.includes(".") ? fallbackName : `${fallbackName}${ext ? `.${ext}` : ""}`;
-  return new File([blob], name, { type: blob.type || undefined });
+  const ext = url.split(/[?#]/)[0].split(".").pop() || "bin";
+  const finalName = name.includes(".") ? name : `${name}.${ext}`;
+  return new File([blob], finalName, { type: blob.type || "application/octet-stream" });
+}
+
+export function loadExampleInto(app) {
+  const ex = exampleItem(app);
+  pending = {
+    appId: app.id,
+    values: { ...(ex?.values || {}), ...(ex?.seed != null ? { seed: ex.seed } : {}) },
+    inputs: ex?.inputs || [],
+    run: false,
+  };
+  if (location.hash === `#/app/${app.id}`) location.replace(`#/app/${app.id}?ex=${Date.now()}`);
+  else location.hash = `#/app/${app.id}`;
 }
 
 export function recreate(item, { run = false } = {}) {
-  const app = byId.get(item.app);
-  if (!app) return;
-  const payload = { appId: app.id, values: { ...(item.values || {}) }, preset: item.preset || null, files: (item.inputs || []).filter((i) => i.file), run };
-  if (activeController && activeController.app.id === app.id) {
-    activeController.load(payload);
+  pending = {
+    appId: item.app,
+    values: { ...(item.values || {}), ...(item.seed != null ? { seed: item.seed } : {}) },
+    preset: item.preset ?? null,
+    inputs: item.inputs || [],
+    run,
+  };
+  if (location.hash.startsWith(`#/app/${item.app}`)) {
+    location.replace(`#/app/${item.app}?r=${Date.now()}`);
   } else {
-    pendingLoad = payload;
-    location.hash = `#/app/${app.id}`;
+    location.hash = `#/app/${item.app}`;
   }
 }
 
 export function useIn(anchor, item, done) {
-  const targets = apps.filter((a) => a.inputs.some((i) => i.type === item.type && !i.paint));
-  if (!targets.length) return;
-  const preferred = targets.filter((a) => a.id !== item.app).slice(0, 10);
-  const rest = targets.filter((a) => a.id !== item.app).slice(10);
+  const mediaKind = item.type === "video" ? "video" : "image";
+  const compatible = apps.filter((a) => a.inputs.some((i) => i.type === mediaKind && !i.paint));
+  const preferredIds = mediaKind === "video"
+    ? ["recast", "mixed-media", "upscale-video", "smooth", "reframe", "extend-video", "vfx-day-to-night", "dub"]
+    : ["video", "relight", "edit", "upscale", "remove-bg", "effects", "morph", "angles", "camera-moves", "speak"];
+  const top = preferredIds.map((id) => compatible.find((a) => a.id === id)).filter(Boolean);
+  const topSet = new Set(top.map((a) => a.id));
+  const rest = compatible.filter((a) => !topSet.has(a.id));
 
-  const sendTo = (target) => {
+  const sendTo = (targetApp) => {
+    const targetInput = targetApp.inputs.find((i) => i.type === mediaKind && !i.paint);
+    if (!targetInput) return;
+    pending = {
+      appId: targetApp.id,
+      values: {},
+      inputs: [{ id: targetInput.id, file: item.full, name: `${item.app}.${mediaKind === "video" ? "mp4" : "png"}` }],
+      run: false,
+    };
     closePopover();
-    const inp = target.inputs.find((i) => i.type === item.type && !i.paint);
-    if (!inp) return;
-    const payload = { appId: target.id, values: {}, files: [{ id: inp.id, file: item.full, name: downloadName(item, item.full) }], run: false };
     done?.();
-    if (activeController && activeController.app.id === target.id) {
-      activeController.load(payload);
-    } else {
-      pendingLoad = payload;
-      location.hash = `#/app/${target.id}`;
-    }
-    toast(t("toast.sent", { app: target.name }));
+    toast(t("toast.sent", { app: targetApp.name }));
+    if (location.hash.startsWith(`#/app/${targetApp.id}`)) location.replace(`#/app/${targetApp.id}?u=${Date.now()}`);
+    else location.hash = `#/app/${targetApp.id}`;
   };
 
-  const rowFor = (a) => {
-    const ex = a.example;
-    const th = ex?.poster || (ex && ex.type !== "video" ? ex.card : null);
-    return el("button", { class: "opt", type: "button", onclick: () => sendTo(a) },
-      el("span", { class: "thumb" }, th ? el("img", { src: th, alt: "" }) : icon(iconOf(a))),
-      el("span", { class: "two" }, el("b", {}, a.name), el("small", {}, tagline(a))));
-  };
+  const row = (a) => el("button", { class: "opt", type: "button", onclick: () => sendTo(a) },
+    el("span", { class: "thumb" }, exampleItem(a) ? thumb(exampleItem(a), { play: "none" }) : icon(iconOf(a))),
+    el("span", { class: "two" }, el("b", {}, a.name), el("small", {}, tagline(a))));
 
-  const box = el("div", { class: "usein" },
+  const content = el("div", { class: "usein" },
     el("h4", {}, t("act.usein")),
-    ...preferred.map(rowFor),
-    rest.length ? el("details", {}, el("summary", {}, t("usein.more", { n: rest.length })), ...rest.map(rowFor)) : null);
-  popover(anchor, box, { align: "end", width: 320 });
-}
+    ...top.map(row),
+    rest.length ? el("details", {},
+      el("summary", {}, t("usein.more", { n: rest.length })),
+      ...rest.map(row)) : null);
 
-function isAdvanced(input) {
-  return ["seed", "steps", "cfg", "guidance", "negative", "negative_prompt", "denoise", "shift"].includes(input.id)
-    || input.type === "seed";
-}
-
-function acceptOf(type) {
-  return type === "video" ? "video/*" : type === "audio" ? "audio/*" : "image/*";
-}
-
-function defaultState(app) {
-  const values = {};
-  for (const inp of app.inputs) {
-    if (isMedia(inp.type)) continue;
-    if (inp.multiple) values[inp.id] = Array.isArray(inp.default) ? [...inp.default] : [];
-    else if (inp.default !== undefined) values[inp.id] = inp.default;
-    else if (inp.type === "toggle") values[inp.id] = false;
-    else if (inp.type === "seed") values[inp.id] = -1;
-    else if (inp.type === "select" && inp.options?.length) values[inp.id] = inp.options[0].value;
-    else values[inp.id] = "";
-  }
-  return values;
-}
-
-function parseHashQuery() {
-  const q = location.hash.split("?")[1];
-  return q ? new URLSearchParams(q) : new URLSearchParams();
-}
-
-function buildHowTab(app) {
-  const grid = el("div", { class: "how-grid" });
-
-  // Pipeline card
-  const cliParts = ["npm run app --", app.id];
-  for (const inp of app.inputs) {
-    if (isMedia(inp.type) && inp.required) cliParts.push(`--file ${inp.id}=path/to/${inp.id}.${inp.type === "video" ? "mp4" : inp.type === "audio" ? "mp3" : "jpg"}`);
-    else if (inp.type === "textarea" && inp.required) cliParts.push(`--set ${inp.id}="${String(inp.default || "your prompt").slice(0, 48)}"`);
-  }
-  const pipeCard = el("div", { class: "card" },
-    el("h3", {}, icon("layers"), t("how.pipeline")),
-    el("p", {}, t("how.pipeline.d", { id: app.id })),
-    el("div", { class: "statline" },
-      el("span", {}, `${t("how.pack")}: ${app.pack}`),
-      el("span", {}, app.status),
-      app.higgsfield_feature ? el("span", {}, `${t("how.equiv")}: ${app.higgsfield_feature}`) : null),
-    el("div", { style: { display: "flex", gap: "10px", alignItems: "center", flexWrap: "wrap" } },
-      el("a", { class: "btn small", href: `/api/apps/${app.id}/workflow`, download: `freefield-${app.id}.json` }, icon("download"), t("how.workflow")),
-      el("span", { class: "dim", style: { fontSize: "12px" } }, t("how.workflow.d"))),
-    el("div", { style: { display: "grid", gap: "6px" } },
-      el("small", { class: "dim" }, t("how.download")),
-      el("pre", { class: "code" }, `modal run infra/modal_app.py::download --pack ${app.pack}`)),
-    el("div", { style: { display: "grid", gap: "6px" } },
-      el("small", { class: "dim" }, t("how.cli")),
-      el("pre", { class: "code" }, cliParts.join(" "))));
-  grid.append(pipeCard);
-
-  // Open-weight models card
-  const totalGb = app.models.reduce((s, m) => s + (m.optional ? 0 : (Number(m.gb) || 0)), 0);
-  const modelsCard = el("div", { class: "card" },
-    el("h3", {}, icon("box"), t("how.models"), el("span", { class: "dim", style: { marginLeft: "auto", fontWeight: 500, fontSize: "12.5px" } }, t("how.total", { gb: totalGb.toFixed(1) }))),
-    app.models.length ? el("table", { class: "models" }, el("tbody", {}, ...app.models.map((m) => {
-      const sub = [m.repo, m.license, m.gated ? t("how.gated") : null, m.optional ? t("how.optional") : null].filter(Boolean).join(" · ");
-      return el("tr", {},
-        el("td", {}, el("div", { style: { fontWeight: 600 } }, m.name), el("small", { class: "dim" }, sub)),
-        el("td", { class: "r" }, `${m.gb} ${t("unit.gb")}`));
-    }))) : el("p", {}, t("fit.none")));
-  grid.append(modelsCard);
-
-  // VRAM card
-  if (app.vram) {
-    const v = app.vram;
-    const fit = fitOf(app);
-    const maxGb = Math.max(48, v.whole_gb || 0, v.measured_gb || 0);
-    const pct = (g) => `${Math.min(100, ((g || 0) / maxGb) * 100)}%`;
-    const row = (label, gb, cls = "") => el("div", { style: { display: "grid", gap: "6px" } },
-      el("div", { style: { display: "flex", justifyContent: "space-between", fontSize: "12.5px" } },
-        el("span", { class: "dim" }, label), el("b", {}, `${Number(gb).toFixed(2)} ${t("unit.gb")}`)),
-      el("div", { class: "vbar" }, el("i", { class: cls, style: { width: pct(gb) } }), el("u", { style: { left: pct(24) } })));
-    grid.append(el("div", { class: "card" },
-      el("h3", {}, icon("chip"), t("how.vram"), fit ? el("span", { class: `fit ${fit[1]}`, style: { marginLeft: "auto" } }, t(fit[0])) : null),
-      row(t("how.whole"), v.whole_gb || 0, "whole"),
-      row(t("how.phase"), v.largest_phase_gb || 0),
-      v.measured_gb ? row(t("how.measured"), v.measured_gb) : null));
-  }
-
-  // Credits & notes
-  if (app.credits?.length || app.notes) {
-    grid.append(el("div", { class: "card" },
-      app.credits?.length ? el("h3", {}, t("how.credits")) : null,
-      ...(app.credits || []).map((c) => el("p", {}, c)),
-      app.notes ? el("h3", { style: { marginTop: app.credits?.length ? "6px" : 0 } }, t("how.notes")) : null,
-      app.notes ? el("p", {}, app.notes) : null));
-  }
-
-  return grid;
-}
-
-function buildLibraryTab(app, onLoadExample, onPickOption) {
-  const wrap = el("div", { style: { display: "grid", gap: "20px" } });
-  const item = exampleItem(app);
-  if (item) {
-    const stats = [];
-    if (item.seconds) stats.push(t("view.gpu", { s: fmtSeconds(item.seconds) }));
-    if (item.peak) stats.push(t("view.peak", { gb: Number(item.peak).toFixed(1) }));
-    if (item.gpu) stats.push(item.gpu.split(",")[0]);
-
-    const valRows = Object.entries(item.values || {}).filter(([, v]) => v !== "" && v !== null && v !== undefined).map(([k, v]) => {
-      const def = app.inputs.find((i) => i.id === k);
-      const label = def?.options?.find((o) => String(o.value) === String(v))?.label ?? String(v);
-      return [def?.label || k, label];
-    });
-
-    wrap.append(el("div", { class: "ex-big" },
-      el("div", { class: "stage" }, fullMedia(item.type, item.full, { poster: item.poster, autoplay: true })),
-      el("div", { class: "side2" },
-        el("div", { style: { display: "flex", alignItems: "center", justifyContent: "space-between", gap: "8px" } },
-          el("b", {}, t("ws.example")),
-          flagButton(app.id, { mini: true })),
-        stats.length ? el("div", { class: "statline" }, ...stats.map((s) => el("span", {}, s))) : null,
-        item.inputs.length ? el("div", { class: "ins-row" }, ...item.inputs.map((inp) =>
-          el("figure", {},
-            el("div", { class: "media" }, inp.thumb ? el("img", { src: inp.thumb, alt: inp.label }) : icon(inp.type === "video" ? "video" : "image")),
-            el("figcaption", {}, inp.label)))) : null,
-        valRows.length ? el("dl", { class: "vals" }, ...valRows.flatMap(([k, v]) => [el("dt", {}, k), el("dd", {}, v)])) : null,
-        el("div", { style: { display: "flex", gap: "8px", flexWrap: "wrap" } },
-          el("button", { class: "btn lime small", type: "button", onclick: onLoadExample }, icon("redo"), t("ws.useex")),
-          el("button", { class: "btn ghost small", type: "button", onclick: () => hooks.compare?.(item) }, icon("compare"), t("act.compare")),
-          el("a", { class: "btn ghost small", href: item.full, download: downloadName(item, item.full) }, icon("download"), t("act.download"))))));
-  } else {
-    wrap.append(el("div", { class: "empty" }, t("explore.noex")));
-  }
-
-  // Per-option gallery examples if present
-  const galleryInputs = app.inputs.filter((i) => i.type === "select" && i.gallery && app.example?.options?.[i.id]);
-  for (const inp of galleryInputs) {
-    const shots = app.example.options[inp.id];
-    const opts = (inp.options || []).filter((o) => shots[String(o.value)]);
-    if (!opts.length) continue;
-    wrap.append(
-      el("h3", { class: "display", style: { margin: "8px 0 0", fontSize: "20px" } }, inp.label),
-      el("div", { class: "fx-wall" }, ...opts.map((opt) =>
-        optionTile(opt, shots[String(opt.value)], {
-          play: "hover",
-          flagKey: flags.key(app.id, inp.id, String(opt.value)),
-          onPick: () => onPickOption(inp.id, opt.value),
-        }))));
-  }
-
-  return wrap;
+  popover(anchor, content, { align: "end" });
 }
 
 export function workspaceView(appId) {
   const app = byId.get(appId);
   if (!app) {
-    return { node: el("div", { class: "page" }, el("div", { class: "empty" }, `Unknown app "${appId}".`)), app: null };
+    return {
+      node: el("div", { class: "page" }, el("div", { class: "empty" }, `Unknown app: ${appId}`)),
+      app: null,
+    };
   }
-  rememberApp(app);
 
   const layout = layoutOf(app);
-  const values = defaultState(app);
-  const files = new Map();       // input.id -> File
-  const fileUrls = new Map();    // input.id -> objectURL
-  let preset = null;
-  let batch = 1;
+  const values = {};
+  const files = {};
+  const previews = new Map();
+  let presetId = null;
   let activeTab = "history";
-  let dense = Boolean(store.get("ws.dense", false));
-  const cleanups = [];
-  const fieldUpdaters = [];
-  const missingEls = new Map();
+  let dense = false;
+  let submitting = false;
+  let count = 1;
+  let lastSeed = null;
 
-  // Apply URL query overrides (e.g., clicking a gallery option on Explore)
-  const hashQ = parseHashQuery();
+  // Initial defaults
   for (const inp of app.inputs) {
-    if (!isMedia(inp.type) && hashQ.has(inp.id)) {
-      const raw = hashQ.get(inp.id);
-      if (inp.type === "select" && inp.options) {
-        const hit = inp.options.find((o) => String(o.value) === raw);
-        if (hit) values[inp.id] = hit.value;
-      } else {
-        values[inp.id] = raw;
+    if (isFile(inp)) continue;
+    if (inp.default !== undefined) values[inp.id] = inp.default;
+    else if (inp.type === "select" && inp.multiple) values[inp.id] = [];
+    else if (inp.type === "select" && inp.options?.length) values[inp.id] = inp.options[0].value;
+    else if (inp.type === "toggle") values[inp.id] = false;
+  }
+
+  // Option from URL ?opt=input:value
+  const optMatch = /\?opt=([^&]+)/.exec(location.hash);
+  if (optMatch) {
+    const [inpId, val] = decodeURIComponent(optMatch[1]).split(":");
+    const inp = app.inputs.find((i) => i.id === inpId);
+    if (inp) values[inpId] = val;
+  }
+
+  // Consume pending state from recreate / useIn / loadExampleInto
+  const loadJob = pending && pending.appId === app.id ? pending : null;
+  if (loadJob) {
+    pending = null;
+    Object.assign(values, loadJob.values || {});
+    if (loadJob.preset) presetId = loadJob.preset;
+  }
+
+  const cleanups = [];
+  const mainBody = el("div", { style: { display: "grid", gap: "14px", flex: 1, minHeight: 0 } });
+  const fieldUpdaters = new Map();
+
+  function setFile(inputId, file) {
+    const prevUrl = previews.get(inputId);
+    if (prevUrl) URL.revokeObjectURL(prevUrl);
+    if (file) {
+      files[inputId] = file;
+      previews.set(inputId, URL.createObjectURL(file));
+    } else {
+      delete files[inputId];
+      previews.delete(inputId);
+      // Clear any mask painted over this image
+      for (const inp of app.inputs) {
+        if (inp.paint === inputId) setFile(inp.id, null);
       }
     }
-  }
-
-  const revokeUrl = (id) => {
-    const u = fileUrls.get(id);
-    if (u) { URL.revokeObjectURL(u); fileUrls.delete(id); }
-  };
-  const setFile = (id, file) => {
-    revokeUrl(id);
-    if (file) {
-      files.set(id, file);
-      fileUrls.set(id, URL.createObjectURL(file));
-    } else {
-      files.delete(id);
-    }
-    // Clear any painted mask that depends on this photo if the photo changed
+    fieldUpdaters.get(inputId)?.();
     for (const inp of app.inputs) {
-      if (inp.paint === id && !file) { revokeUrl(inp.id); files.delete(inp.id); }
+      if (inp.paint === inputId) fieldUpdaters.get(inp.id)?.();
     }
-    refreshFields();
-  };
-  const refreshFields = () => { for (const fn of fieldUpdaters) fn(); };
-
-  // Load example or recreate payload
-  async function loadPayload(payload) {
-    for (const [k, v] of Object.entries(payload.values || {})) {
-      const inp = app.inputs.find((i) => i.id === k);
-      if (!inp || isMedia(inp.type)) continue;
-      if (inp.multiple) values[k] = Array.isArray(v) ? [...v] : (v ? [v] : []);
-      else values[k] = v;
-    }
-    if (payload.preset !== undefined) preset = payload.preset;
-    refreshFields();
-    if (payload.files?.length) {
-      await Promise.all(payload.files.map(async (f) => {
-        const inp = app.inputs.find((i) => i.id === f.id);
-        if (!inp || !isMedia(inp.type) || !f.file) return;
-        try {
-          const fileObj = await urlToFile(f.file, f.name || `${inp.id}.${inp.type === "video" ? "mp4" : inp.type === "audio" ? "mp3" : "jpg"}`);
-          setFile(inp.id, fileObj);
-        } catch { /* ignore broken example file */ }
-      }));
-    }
-    toast(t("toast.loaded", { app: app.name }));
-    if (payload.run) void submitRun();
   }
 
-  const loadLabExample = () => {
-    const ex = exampleItem(app);
-    if (!ex) return;
-    void loadPayload({ appId: app.id, values: ex.values, files: ex.inputs, preset: null, run: false });
-  };
+  cleanups.push(() => {
+    for (const u of previews.values()) URL.revokeObjectURL(u);
+    previews.clear();
+  });
 
-  // Submit run(s)
-  let submitting = false;
-  const noteEl = el("p", { class: layout === "composer" ? "cmp-hint" : "side-note", hidden: true });
-  const setNote = (msg, err = false) => {
-    noteEl.textContent = msg || "";
-    noteEl.hidden = !msg;
-    noteEl.className = `${layout === "composer" ? "cmp-hint" : "side-note"}${err ? " err" : ""}`;
-  };
+  // Switcher popover for familyOf(app)
+  function openFamilyPicker(anchor) {
+    const fam = familyOf(app);
+    const list = el("div", {},
+      el("h4", {}, t("ws.change")),
+      ...fam.map((a) => {
+        const ex = exampleItem(a);
+        return el("a", {
+          class: "opt", href: `#/app/${a.id}`, "aria-selected": String(a.id === app.id),
+          onclick: () => closePopover(),
+        },
+        el("span", { class: "thumb" }, ex ? thumb(ex, { play: "none" }) : icon(iconOf(a))),
+        el("span", { class: "two" }, el("b", {}, a.name), el("small", {}, tagline(a))),
+        el("span", { class: "chk" }, icon("check")));
+      }));
+    popover(anchor, list);
+  }
 
-  const canRun = app.runnable && !app.needs && !app.missing_pack;
-  async function submitRun() {
-    if (submitting) return;
-    if (!app.runnable) {
-      toast(app.status === "draft" ? t("ws.draft") : t("ws.noworkflow"), { error: true });
+  function openSelectPopover(anchor, inp, onChange) {
+    if (inp.gallery) {
+      const optShots = app.example?.options?.[inp.id] || {};
+      const grid = el("div", { class: "fx-grid" }, ...(inp.options || []).map((opt) =>
+        optionTile(opt, optShots[String(opt.value)] || null, {
+          selected: String(values[inp.id]) === String(opt.value),
+          play: "hover",
+          flagKey: optShots[String(opt.value)] ? flags.key(app.id, inp.id, opt.value) : null,
+          onPick: () => {
+            values[inp.id] = opt.value;
+            closePopover();
+            onChange();
+          },
+        })));
+      popover(anchor, el("div", {}, el("h4", {}, inp.label), grid), { wide: true });
       return;
     }
-    // Validate required inputs
-    for (const inp of app.inputs) {
-      const target = missingEls.get(inp.id);
-      if (isMedia(inp.type)) {
-        if ((inp.required || inp.paint) && !files.has(inp.id)) {
-          target?.classList.remove("missing");
-          void target?.offsetWidth;
-          target?.classList.add("missing");
-          setNote(inp.paint ? t("paint.empty") : t("ws.need", { label: inp.label }), true);
+
+    if (inp.multiple) {
+      const max = inp.multiple.max;
+      const ordered = Boolean(inp.multiple.ordered);
+      const wrap = el("div");
+      const drawMulti = () => {
+        const cur = Array.isArray(values[inp.id]) ? [...values[inp.id]] : [];
+        const hint = max ? t(ordered ? "ws.multi.upto.ordered" : "ws.multi.upto", { n: max }) : "";
+        wrap.replaceChildren(
+          el("h4", {},
+            inp.label,
+            hint ? el("span", { class: "n" }, hint) : null,
+            cur.length ? el("button", {
+              class: "mini-link", type: "button",
+              onclick: () => { values[inp.id] = []; drawMulti(); onChange(); },
+            }, t("ws.multi.clear")) : null),
+          el("div", { class: "multi-list" }, ...(inp.options || []).map((opt) => {
+            const val = String(opt.value);
+            const idx = cur.map(String).indexOf(val);
+            const picked = idx >= 0;
+            return el("button", {
+              class: "opt", type: "button", "aria-pressed": String(picked),
+              onclick: () => {
+                if (picked) {
+                  values[inp.id] = cur.filter((x) => String(x) !== val);
+                } else {
+                  if (max && cur.length >= max) { toast(t("ws.multi.max", { n: max }), { error: true }); return; }
+                  values[inp.id] = [...cur, opt.value];
+                }
+                drawMulti();
+                onChange();
+              },
+            },
+            el("span", {}, opt.label),
+            picked ? el("span", { class: "pick" }, ordered ? String(idx + 1) : icon("check")) : null);
+          })));
+      };
+      drawMulti();
+      popover(anchor, wrap);
+      return;
+    }
+
+    popover(anchor, el("div", {},
+      el("h4", {}, inp.label),
+      ...(inp.options || []).map((opt) => el("button", {
+        class: "opt", type: "button", "aria-selected": String(values[inp.id] === opt.value || String(values[inp.id]) === String(opt.value)),
+        onclick: () => { values[inp.id] = opt.value; closePopover(); onChange(); },
+      }, el("span", {}, opt.label), el("span", { class: "chk" }, icon("check"))))));
+  }
+
+  function selectDisplay(inp) {
+    const v = values[inp.id];
+    if (inp.multiple) {
+      const list = Array.isArray(v) ? v : [];
+      if (!list.length) return t("ws.none");
+      const labels = list.map((x) => inp.options?.find((o) => String(o.value) === String(x))?.label ?? x);
+      return labels.slice(0, 2).join(", ") + (labels.length > 2 ? ` +${labels.length - 2}` : "");
+    }
+    return inp.options?.find((o) => o.value === v || String(o.value) === String(v))?.label ?? String(v ?? "");
+  }
+
+  function renderFieldControl(inp, { compact = false } = {}) {
+    const box = el("div", { class: "field" });
+    const lbl = el("div", { class: "lbl" },
+      el("span", {}, inp.label),
+      !inp.required && !isFile(inp) ? el("small", {}, t("ws.optional")) : null);
+
+    if (isFile(inp)) {
+      const fileInput = el("input", {
+        type: "file", hidden: true,
+        accept: inp.type === "video" ? "video/*" : inp.type === "audio" ? "audio/*" : "image/*",
+        onchange: () => { if (fileInput.files?.[0]) setFile(inp.id, fileInput.files[0]); fileInput.value = ""; },
+      });
+
+      const zone = el("div", { class: "drop", tabindex: "0", role: "button" });
+      const drawDrop = async () => {
+        const f = files[inp.id];
+        const url = previews.get(inp.id);
+        zone.className = "drop";
+        if (inp.paint) zone.classList.add("paint");
+
+        if (f && url) {
+          zone.classList.add("has");
+          let previewEl;
+          if (inp.paint && previews.get(inp.paint)) {
+            previewEl = await maskPreview(previews.get(inp.paint), f).catch(() => el("img", { src: url, alt: f.name }));
+          } else if (inp.type === "video") {
+            previewEl = el("video", { src: url, controls: true, muted: true, playsinline: true });
+          } else if (inp.type === "audio") {
+            previewEl = el("audio", { src: url, controls: true });
+          } else {
+            previewEl = el("img", { src: url, alt: f.name });
+          }
+          zone.replaceChildren(
+            previewEl,
+            el("span", { class: "fname" }, f.name),
+            el("div", { class: "bar2" },
+              el("button", {
+                class: "mini", type: "button", title: inp.paint ? t("paint.edit") : t("ws.replace"),
+                onclick: async (e) => {
+                  e.stopPropagation();
+                  if (inp.paint) {
+                    const srcFile = files[inp.paint];
+                    if (srcFile) {
+                      const nextMask = await openPainter(srcFile, { mask: f, title: inp.label });
+                      if (nextMask) setFile(inp.id, nextMask);
+                    }
+                  } else {
+                    fileInput.click();
+                  }
+                },
+              }, icon(inp.paint ? "redo" : "upload")),
+              el("button", {
+                class: "mini", type: "button", title: t("ws.remove"),
+                onclick: (e) => { e.stopPropagation(); setFile(inp.id, null); },
+              }, icon("x"))),
+            fileInput);
           return;
         }
-      } else if (inp.required) {
-        const v = values[inp.id];
-        if (v === undefined || v === null || String(v).trim() === "") {
-          target?.classList.remove("missing");
-          void target?.offsetWidth;
-          target?.classList.add("missing");
-          target?.focus?.();
-          setNote(t("ws.needtext", { label: inp.label }), true);
+
+        const srcFile = inp.paint ? files[inp.paint] : null;
+        if (inp.paint && !srcFile) zone.classList.add("off");
+        const hintBits = [t("ws.drop.hint")];
+        if (inp.limits?.max_mb) hintBits.push(t("ws.drop.mb", { mb: inp.limits.max_mb }));
+        if (inp.limits?.seconds) hintBits.push(t("ws.drop.seconds", { a: inp.limits.seconds[0], b: inp.limits.seconds[1] }));
+
+        zone.replaceChildren(
+          inp.paint && previews.get(inp.paint) ? el("img", { src: previews.get(inp.paint), alt: "" }) : null,
+          el("span", { class: "ic" }, icon(inp.paint ? "sliders" : inp.type)),
+          el("b", {}, inp.paint ? t("paint.cta") : t(`ws.drop.${inp.type}`)),
+          el("small", {}, inp.paint && !srcFile
+            ? t("paint.first", { label: app.inputs.find((x) => x.id === inp.paint)?.label ?? inp.paint })
+            : hintBits.join(" · ")),
+          fileInput);
+      };
+
+      zone.onclick = async () => {
+        if (inp.paint) {
+          const srcFile = files[inp.paint];
+          if (!srcFile) {
+            toast(t("paint.first", { label: app.inputs.find((x) => x.id === inp.paint)?.label ?? inp.paint }), { error: true });
+            return;
+          }
+          const mask = await openPainter(srcFile, { mask: files[inp.id] ?? null, title: inp.label });
+          if (mask) setFile(inp.id, mask);
+        } else {
+          fileInput.click();
+        }
+      };
+      zone.onkeydown = (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); zone.click(); } };
+      zone.addEventListener("dragover", (e) => { e.preventDefault(); zone.classList.add("over"); });
+      zone.addEventListener("dragleave", () => zone.classList.remove("over"));
+      zone.addEventListener("drop", (e) => {
+        e.preventDefault();
+        zone.classList.remove("over");
+        const f = e.dataTransfer.files?.[0];
+        if (f && !inp.paint) setFile(inp.id, f);
+      });
+
+      fieldUpdaters.set(inp.id, drawDrop);
+      drawDrop();
+      box.append(lbl, zone);
+      if (inp.help) box.append(el("p", { class: "help" }, inp.help));
+      return box;
+    }
+
+    if (inp.type === "textarea") {
+      const ta = el("textarea", {
+        class: compact ? "short" : "",
+        placeholder: inp.displayDefault ? t("ws.eg", { x: inp.displayDefault }) : t("ws.prompt.ph"),
+        value: values[inp.id] ?? "",
+        oninput: () => { values[inp.id] = ta.value; },
+      });
+      fieldUpdaters.set(inp.id, () => { ta.value = String(values[inp.id] ?? ""); });
+      box.append(lbl, ta);
+    } else if (inp.type === "text") {
+      const input = el("input", {
+        type: "text",
+        placeholder: inp.displayDefault ? t("ws.eg", { x: inp.displayDefault }) : "",
+        value: values[inp.id] ?? "",
+        oninput: () => { values[inp.id] = input.value; },
+      });
+      fieldUpdaters.set(inp.id, () => { input.value = String(values[inp.id] ?? ""); });
+      box.append(lbl, input);
+    } else if (inp.type === "slider" || inp.type === "number") {
+      const min = inp.min ?? 0;
+      const max = inp.max ?? 100;
+      const step = inp.step ?? 1;
+      const valNode = el("b", {}, String(values[inp.id] ?? min));
+      const range = el("input", {
+        type: "range", min: String(min), max: String(max), step: String(step),
+        value: String(values[inp.id] ?? min),
+        oninput: () => {
+          const num = Number(range.value);
+          values[inp.id] = num;
+          valNode.textContent = String(num);
+          range.style.setProperty("--p", `${clamp(((num - min) / Math.max(1e-6, max - min)) * 100, 0, 100)}%`);
+        },
+      });
+      const sync = () => {
+        const num = Number(values[inp.id] ?? min);
+        range.value = String(num);
+        valNode.textContent = String(num);
+        range.style.setProperty("--p", `${clamp(((num - min) / Math.max(1e-6, max - min)) * 100, 0, 100)}%`);
+      };
+      sync();
+      fieldUpdaters.set(inp.id, sync);
+      box.append(el("div", { class: "range" }, el("div", { class: "top" }, el("span", {}, inp.label), valNode), range));
+    } else if (inp.type === "seed") {
+      const numIn = el("input", {
+        type: "number", value: String(values[inp.id] ?? -1),
+        oninput: () => { values[inp.id] = Number(numIn.value); },
+      });
+      const sync = () => { numIn.value = String(values[inp.id] ?? -1); };
+      fieldUpdaters.set(inp.id, sync);
+      box.append(lbl,
+        el("div", { style: { display: "flex", gap: "6px", alignItems: "center" } },
+          numIn,
+          el("button", {
+            class: "btn small ghost", type: "button", title: t("ws.seed.random"),
+            onclick: () => { values[inp.id] = -1; sync(); },
+          }, icon("dice")),
+          lastSeed !== null ? el("button", {
+            class: "btn small ghost", type: "button",
+            onclick: () => { values[inp.id] = lastSeed; sync(); },
+          }, t("ws.seed.reuse")) : null));
+    } else if (inp.type === "toggle") {
+      const cb = el("input", {
+        type: "checkbox", checked: Boolean(values[inp.id]),
+        onchange: () => { values[inp.id] = cb.checked; },
+      });
+      fieldUpdaters.set(inp.id, () => { cb.checked = Boolean(values[inp.id]); });
+      box.append(el("label", { class: "togrow" },
+        el("span", { class: "t" }, el("span", {}, inp.label), inp.help ? el("small", {}, inp.help) : null),
+        el("span", { class: "switch" }, cb, el("i"))));
+      return box;
+    } else if (inp.type === "select") {
+      const opts = inp.options || [];
+      const shortSeg = !inp.multiple && !inp.gallery && opts.length > 0 && opts.length <= 4
+        && opts.every((o) => String(o.label).length <= 14);
+
+      if (shortSeg) {
+        const seg = el("div", { class: "seg" });
+        const sync = () => {
+          seg.replaceChildren(...opts.map((opt) => el("button", {
+            type: "button",
+            "aria-pressed": String(values[inp.id] === opt.value || String(values[inp.id]) === String(opt.value)),
+            onclick: () => { values[inp.id] = opt.value; sync(); },
+          }, opt.label)));
+        };
+        sync();
+        fieldUpdaters.set(inp.id, sync);
+        box.append(lbl, seg);
+      } else {
+        const valSpan = el("span", { class: "v" });
+        const btn = el("button", {
+          class: "selrow", type: "button",
+          onclick: () => openSelectPopover(btn, inp, sync),
+        }, valSpan, icon("chev"));
+        const sync = () => {
+          valSpan.textContent = selectDisplay(inp);
+        };
+        sync();
+        fieldUpdaters.set(inp.id, sync);
+        box.append(lbl, btn);
+      }
+    }
+
+    if (inp.help) box.append(el("p", { class: "help" }, inp.help));
+    return box;
+  }
+
+  function applyPreset(p) {
+    presetId = presetId === p.id ? null : p.id;
+    fieldUpdaters.get("__preset")?.();
+  }
+
+  function canRun() {
+    if (!app.workflowPath) return { ok: false, reason: el("span", {}, t("ws.noworkflow")) };
+    if (app.status === "draft" && !draftsAllowed) return { ok: false, reason: el("span", {}, t("ws.draft")) };
+    const need = needNode(app);
+    if (need) return { ok: false, reason: need };
+    return { ok: true, reason: null };
+  }
+
+  async function submitRun() {
+    if (submitting) return;
+    const status = canRun();
+    if (!status.ok) return;
+
+    // Validate required fields client-side for immediate feedback
+    for (const inp of app.inputs) {
+      if (isFile(inp) && !files[inp.id]) {
+        if (inp.required !== false) {
+          toast(inp.paint ? t("paint.empty") : t("ws.need", { label: inp.label }), { error: true });
           return;
         }
       }
+      if (!isFile(inp) && inp.required && !String(values[inp.id] ?? "").trim()) {
+        toast(t("ws.needtext", { label: inp.label }), { error: true });
+        return;
+      }
     }
-    setNote("");
+
     submitting = true;
     try {
-      for (let i = 0; i < batch; i++) {
+      for (let i = 0; i < count; i++) {
         const fd = new FormData();
         for (const inp of app.inputs) {
-          if (isMedia(inp.type)) {
-            const f = files.get(inp.id);
-            if (f) fd.append(inp.id, f, f.name);
+          if (isFile(inp)) {
+            if (files[inp.id]) fd.append(inp.id, files[inp.id], files[inp.id].name);
           } else {
             const v = values[inp.id];
-            if (v === undefined || v === null) continue;
+            if (v === undefined) continue;
             if (inp.multiple) fd.append(inp.id, JSON.stringify(Array.isArray(v) ? v : []));
             else fd.append(inp.id, String(v));
           }
         }
-        if (preset) fd.append("preset", preset);
-        await feed.run(app.id, fd);
+        if (presetId) fd.append("preset", presetId);
+        const entry = await feed.run(app.id, fd);
+        if (entry.values?.seed != null) lastSeed = entry.values.seed;
       }
       toast(t("toast.started", { app: app.name }));
-      if (activeTab !== "history") { activeTab = "history"; drawMain(); }
+      if (activeTab !== "history") {
+        activeTab = "history";
+        drawMain();
+      }
     } catch (err) {
-      setNote(err.message, true);
       toast(err.message, { error: true });
     } finally {
       submitting = false;
     }
   }
 
-  // Shared UI builders
-  function openSwitcher(anchor) {
-    const fam = familyOf(app);
-    const list = fam.length > 1 ? fam : apps.filter((a) => a.section === app.section);
-    const content = el("div", {},
-      el("h4", {}, app.name),
-      ...list.map((a) => {
-        const ex = a.example;
-        const th = ex?.poster || (ex && ex.type !== "video" ? ex.card : null);
-        return el("a", { class: "opt", href: `#/app/${a.id}`, "aria-selected": String(a.id === app.id), onclick: closePopover },
-          el("span", { class: "thumb" }, th ? el("img", { src: th, alt: "" }) : icon(iconOf(a))),
-          el("span", { class: "two" }, el("b", {}, a.name), el("small", {}, tagline(a))),
-          el("span", { class: "chk" }, icon("check")));
-      }));
-    popover(anchor, content, { width: 320 });
-  }
-
   function modesSwitch() {
     if (!app.modes?.length) return null;
-    const siblings = app.modes.map((id) => byId.get(id)).filter(Boolean);
-    if (siblings.length < 2) return null;
-    return el("div", { class: "seg modes" }, ...siblings.map((sib) =>
-      el("button", {
-        type: "button",
-        "aria-pressed": String(sib.id === app.id),
-        onclick: () => { if (sib.id !== app.id) location.hash = `#/app/${sib.id}`; },
-      }, icon(sib.section === "video" ? "video" : "image"), sib.mode_label || sib.name)));
+    return el("div", { class: "seg modes", role: "group", "aria-label": app.mode_label || "Mode" },
+      ...app.modes.map((id) => {
+        const other = byId.get(id);
+        if (!other) return null;
+        return el("button", {
+          type: "button", "aria-pressed": String(id === app.id),
+          onclick: () => { if (id !== app.id) location.hash = `#/app/${id}`; },
+        }, icon(iconOf(other)), other.mode_label || other.name);
+      }).filter(Boolean));
   }
 
-  function openSelectPopover(anchor, inp) {
-    const opts = inp.options || [];
-    if (inp.gallery) {
-      const shots = app.example?.options?.[inp.id] || {};
-      const grid = el("div", { class: "fx-grid" }, ...opts.map((opt) =>
-        optionTile(opt, shots[String(opt.value)], {
-          selected: String(values[inp.id]) === String(opt.value),
-          play: "hover",
-          flagKey: shots[String(opt.value)] ? flags.key(app.id, inp.id, String(opt.value)) : null,
-          onPick: () => { values[inp.id] = opt.value; refreshFields(); closePopover(); },
-        })));
-      popover(anchor, el("div", {}, el("h4", {}, inp.label), grid), { cls: "wide", width: 580 });
-      return;
-    }
-    if (inp.multiple) {
-      const max = inp.multiple.max || 99;
-      const ordered = Boolean(inp.multiple.ordered);
-      const wrap = el("div", {});
-      const drawList = () => {
-        const cur = Array.isArray(values[inp.id]) ? values[inp.id] : [];
-        const hint = max < 99 ? t(ordered ? "ws.multi.upto.ordered" : "ws.multi.upto", { n: max }) : "";
-        wrap.replaceChildren(
-          el("h4", {}, inp.label, hint ? el("span", { class: "n" }, hint) : null,
-            cur.length ? el("button", { class: "mini-link", type: "button", onclick: () => { values[inp.id] = []; refreshFields(); drawList(); } }, t("ws.multi.clear")) : null),
-          el("div", { class: "multi-list" }, ...opts.map((o) => {
-            const valStr = String(o.value);
-            const pos = cur.map(String).indexOf(valStr);
-            const picked = pos >= 0;
-            return el("button", {
-              class: "opt",
-              type: "button",
-              "aria-pressed": String(picked),
-              onclick: () => {
-                const next = [...cur];
-                if (picked) next.splice(pos, 1);
-                else if (next.length >= max) { toast(t("ws.multi.max", { n: max }), { error: true }); return; }
-                else next.push(o.value);
-                values[inp.id] = next;
-                refreshFields();
-                drawList();
-              },
-            },
-            el("span", {}, o.label),
-            picked ? el("span", { class: "pick" }, ordered ? String(pos + 1) : icon("check")) : null);
-          })));
-      };
-      drawList();
-      popover(anchor, wrap, { width: 290 });
-      return;
-    }
-    const box = el("div", {},
-      el("h4", {}, inp.label),
-      ...opts.map((o) => el("button", {
-        class: "opt",
-        type: "button",
-        "aria-selected": String(String(values[inp.id]) === String(o.value)),
-        onclick: () => { values[inp.id] = o.value; refreshFields(); closePopover(); },
-      }, el("span", {}, o.label), el("span", { class: "chk" }, icon("check")))));
-    popover(anchor, box, { width: 280 });
-  }
-
-  function selectLabel(inp) {
-    const v = values[inp.id];
-    if (inp.multiple) {
-      const list = Array.isArray(v) ? v : [];
-      if (!list.length) return t("ws.none");
-      return list.map((x) => inp.options?.find((o) => String(o.value) === String(x))?.label ?? String(x)).join(" → ");
-    }
-    return inp.options?.find((o) => o.value === v || String(o.value) === String(v))?.label ?? String(v ?? t("ws.none"));
-  }
-
-  function batchCounter() {
-    const minus = el("button", { type: "button", "aria-label": "-", onclick: () => { batch = clamp(batch - 1, 1, 4); update(); } }, "−");
-    const plus = el("button", { type: "button", "aria-label": "+", onclick: () => { batch = clamp(batch + 1, 1, 4); update(); } }, "+");
-    const label = el("span", {});
-    const update = () => {
-      label.replaceChildren(String(batch), el("small", {}, "/4"));
-      minus.disabled = batch <= 1;
-      plus.disabled = batch >= 4;
-    };
-    update();
-    return el("div", { class: "count", title: t("ws.count") }, minus, label, plus);
-  }
-
-  function generateButton() {
+  function generateButton({ wide = false } = {}) {
     const est = estimate(app);
-    return el("button", {
-      class: "generate",
-      type: "button",
-      disabled: !canRun,
+    const runStatus = canRun();
+    const btn = el("button", {
+      class: `generate${wide ? " wide" : ""}`, type: "button",
+      disabled: !runStatus.ok,
       title: est ? t("ws.est", { gpu: est.gpu }) : null,
       onclick: submitRun,
     },
+    icon("spark"),
     t("ws.generate"),
-    est ? el("span", { class: "cost" }, icon("spark"), fmtShort(est.seconds)) : icon("spark"));
+    est ? el("span", { class: "cost" }, fmtSeconds(est.seconds)) : null);
+    return btn;
   }
 
-  // Dropzone field for sidebar
-  function buildDropzone(inp) {
-    const zone = el("div", { class: "drop", role: "button", tabindex: "0" });
-    missingEls.set(inp.id, zone);
-
-    if (inp.paint) {
-      zone.classList.add("paint");
-      const openBrush = async () => {
-        const srcFile = files.get(inp.paint);
-        if (!srcFile) {
-          const srcInp = app.inputs.find((i) => i.id === inp.paint);
-          toast(t("paint.first", { label: srcInp?.label || inp.paint }), { error: true });
-          return;
-        }
-        const mask = await openPainter(srcFile, { mask: files.get(inp.id) || null, title: inp.label });
-        if (mask) setFile(inp.id, mask);
-      };
-      zone.onclick = openBrush;
-      zone.onkeydown = (e) => { if (e.key === "Enter") openBrush(); };
-      const update = async () => {
-        const srcUrl = fileUrls.get(inp.paint);
-        const maskFile = files.get(inp.id);
-        zone.classList.toggle("off", !srcUrl);
-        zone.classList.toggle("has", Boolean(srcUrl && maskFile));
-        zone.classList.remove("missing");
-        if (srcUrl && maskFile) {
-          try {
-            const canvas = await maskPreview(srcUrl, maskFile);
-            zone.replaceChildren(canvas,
-              el("div", { class: "bar2" },
-                el("button", { class: "mini", type: "button", title: t("paint.edit"), onclick: (e) => { e.stopPropagation(); openBrush(); } }, icon("wand")),
-                el("button", { class: "mini", type: "button", title: t("ws.remove"), onclick: (e) => { e.stopPropagation(); setFile(inp.id, null); } }, icon("x"))));
-            return;
-          } catch { /* fall through */ }
-        }
-        const srcInp = app.inputs.find((i) => i.id === inp.paint);
-        zone.replaceChildren(
-          srcUrl ? el("img", { src: srcUrl, alt: "" }) : null,
-          el("span", { class: "ic" }, icon("wand")),
-          el("b", {}, inp.label),
-          el("small", {}, srcUrl ? t("paint.cta") : t("paint.first", { label: srcInp?.label || inp.paint })));
-      };
-      fieldUpdaters.push(update);
-      update();
-      return zone;
-    }
-
-    const fileInput = el("input", { type: "file", accept: acceptOf(inp.type), hidden: true });
-    fileInput.addEventListener("change", () => { if (fileInput.files?.[0]) setFile(inp.id, fileInput.files[0]); fileInput.value = ""; });
-    zone.addEventListener("click", () => fileInput.click());
-    zone.addEventListener("keydown", (e) => { if (e.key === "Enter") fileInput.click(); });
-    zone.addEventListener("dragover", (e) => { e.preventDefault(); zone.classList.add("over"); });
-    zone.addEventListener("dragleave", () => zone.classList.remove("over"));
-    zone.addEventListener("drop", (e) => {
-      e.preventDefault();
-      zone.classList.remove("over");
-      const f = e.dataTransfer.files?.[0];
-      if (f) setFile(inp.id, f);
-    });
-
-    const lims = [t("ws.drop.hint")];
-    if (inp.limits?.max_mb) lims.push(t("ws.drop.mb", { mb: inp.limits.max_mb }));
-    if (inp.limits?.seconds) lims.push(t("ws.drop.seconds", { a: inp.limits.seconds[0], b: inp.limits.seconds[1] }));
-
-    const update = () => {
-      const f = files.get(inp.id);
-      const u = fileUrls.get(inp.id);
-      zone.classList.toggle("has", Boolean(f));
-      zone.classList.remove("missing");
-      if (f && u) {
-        const preview = inp.type === "video" ? el("video", { src: u, muted: true, controls: true, playsinline: true })
-          : inp.type === "audio" ? el("audio", { src: u, controls: true })
-            : el("img", { src: u, alt: f.name });
-        zone.replaceChildren(preview,
-          el("div", { class: "bar2" },
-            el("button", { class: "mini", type: "button", title: t("ws.replace"), onclick: (e) => { e.stopPropagation(); fileInput.click(); } }, icon("upload")),
-            el("button", { class: "mini", type: "button", title: t("ws.remove"), onclick: (e) => { e.stopPropagation(); setFile(inp.id, null); } }, icon("x"))),
-          el("span", { class: "fname" }, f.name),
-          fileInput);
-      } else {
-        zone.replaceChildren(
-          el("span", { class: "ic" }, icon(inp.type === "video" ? "video" : inp.type === "audio" ? "audio" : "image")),
-          el("b", {}, inp.label),
-          el("small", {}, t(`ws.drop.${inp.type}`)),
-          el("small", {}, lims.join(" · ")),
-          fileInput);
-      }
+  function countControl() {
+    const num = el("span", {}, String(count));
+    const dec = el("button", {
+      type: "button", "aria-label": "-",
+      onclick: () => { if (count > 1) { count--; sync(); } },
+    }, "−");
+    const inc = el("button", {
+      type: "button", "aria-label": "+",
+      onclick: () => { if (count < 4) { count++; sync(); } },
+    }, "+");
+    const sync = () => {
+      num.textContent = String(count);
+      dec.disabled = count <= 1;
+      inc.disabled = count >= 4;
     };
-    fieldUpdaters.push(update);
-    update();
-    return zone;
+    sync();
+    return el("div", { class: "count", title: t("ws.count") }, dec, num, inc);
   }
 
-  // Standard sidebar field builder
-  function buildField(inp) {
-    if (isMedia(inp.type)) return buildDropzone(inp);
-
-    const lbl = el("div", { class: "lbl" },
-      el("span", {}, inp.label),
-      !inp.required && inp.type === "textarea" ? el("small", {}, t("ws.optional")) : null);
-    const help = inp.help ? el("p", { class: "help" }, inp.help) : null;
-
-    if (inp.type === "textarea") {
-      const ta = el("textarea", {
-        class: inp.required ? "" : "short",
-        placeholder: inp.default ? t("ws.eg", { x: String(inp.default) }) : (inp.required ? t("ws.prompt.ph") : t("ws.prompt.opt", { label: inp.label })),
-        value: String(values[inp.id] ?? ""),
-      });
-      missingEls.set(inp.id, ta);
-      ta.addEventListener("input", () => { values[inp.id] = ta.value; ta.classList.remove("missing"); });
-      ta.addEventListener("keydown", (e) => { if ((e.metaKey || e.ctrlKey) && e.key === "Enter") { e.preventDefault(); submitRun(); } });
-      fieldUpdaters.push(() => { if (ta.value !== String(values[inp.id] ?? "")) ta.value = String(values[inp.id] ?? ""); });
-      return el("div", { class: "field" }, lbl, ta, help);
-    }
-
-    if (inp.type === "text") {
-      const input = el("input", { type: "text", value: String(values[inp.id] ?? ""), placeholder: inp.default ? t("ws.eg", { x: String(inp.default) }) : "" });
-      missingEls.set(inp.id, input);
-      input.addEventListener("input", () => { values[inp.id] = input.value; input.classList.remove("missing"); });
-      fieldUpdaters.push(() => { if (input.value !== String(values[inp.id] ?? "")) input.value = String(values[inp.id] ?? ""); });
-      return el("div", { class: "field" }, lbl, input, help);
-    }
-
-    if (inp.type === "slider" || inp.type === "number") {
-      const min = inp.min ?? 0, max = inp.max ?? 100, step = inp.step ?? 1;
-      if (inp.type === "slider") {
-        const valB = el("b", {}, String(values[inp.id]));
-        const range = el("input", { type: "range", min: String(min), max: String(max), step: String(step), value: String(values[inp.id]) });
-        const sync = () => {
-          const n = Number(values[inp.id] ?? min);
-          range.value = String(n);
-          valB.textContent = String(n);
-          range.style.setProperty("--p", `${((n - min) / (max - min || 1)) * 100}%`);
-        };
-        range.addEventListener("input", () => { values[inp.id] = Number(range.value); sync(); });
-        fieldUpdaters.push(sync);
-        sync();
-        return el("div", { class: "field" }, el("div", { class: "range" }, el("div", { class: "top" }, el("span", {}, inp.label), valB), range), help);
-      }
-      const num = el("input", { type: "number", min: inp.min, max: inp.max, step: inp.step, value: String(values[inp.id] ?? "") });
-      num.addEventListener("input", () => { values[inp.id] = Number(num.value); });
-      fieldUpdaters.push(() => { num.value = String(values[inp.id] ?? ""); });
-      return el("div", { class: "field" }, lbl, num, help);
-    }
-
-    if (inp.type === "toggle") {
-      const cb = el("input", { type: "checkbox", checked: Boolean(values[inp.id]) });
-      cb.addEventListener("change", () => { values[inp.id] = cb.checked; });
-      fieldUpdaters.push(() => { cb.checked = Boolean(values[inp.id]); });
-      return el("div", { class: "field" },
-        el("div", { class: "togrow" },
-          el("div", { class: "t" }, el("span", { style: { fontWeight: 600, fontSize: "13px" } }, inp.label), inp.help ? el("small", {}, inp.help) : null),
-          el("label", { class: "switch" }, cb, el("i", {}))));
-    }
-
-    if (inp.type === "seed") {
-      const num = el("input", { type: "number", value: String(values[inp.id] ?? -1), placeholder: "-1" });
-      num.addEventListener("input", () => { values[inp.id] = num.value === "" ? -1 : Number(num.value); });
-      const rnd = el("button", { class: "btn small", type: "button", title: t("ws.seed.random"), onclick: () => { values[inp.id] = -1; refreshFields(); } }, icon("dice"));
-      fieldUpdaters.push(() => { num.value = String(values[inp.id] ?? -1); });
-      return el("div", { class: "field" }, lbl, el("div", { style: { display: "flex", gap: "6px" } }, num, rnd), help);
-    }
-
-    if (inp.type === "select") {
-      const opts = inp.options || [];
-      if (!inp.gallery && !inp.multiple && opts.length <= 4 && opts.every((o) => String(o.label).length <= 14)) {
-        const seg = el("div", { class: "seg" });
-        const btns = opts.map((o) => el("button", {
-          type: "button",
-          onclick: () => { values[inp.id] = o.value; refreshFields(); },
-        }, o.label));
-        seg.append(...btns);
-        const sync = () => {
-          opts.forEach((o, i) => btns[i].setAttribute("aria-pressed", String(String(values[inp.id]) === String(o.value))));
-        };
-        fieldUpdaters.push(sync);
-        sync();
-        return el("div", { class: "field" }, lbl, seg, help);
-      }
-
-      const valSpan = el("span", { class: "v" });
-      const rowBtn = el("button", { class: "selrow", type: "button", onclick: (e) => openSelectPopover(e.currentTarget, inp) }, valSpan, icon("chevD"));
-      const previewHost = inp.gallery ? el("div", { class: "fx-now", hidden: true }) : null;
-      const sync = () => {
-        valSpan.textContent = selectLabel(inp);
-        if (previewHost) {
-          const shot = app.example?.options?.[inp.id]?.[String(values[inp.id])];
-          if (shot) {
-            previewHost.hidden = false;
-            const media = thumb({ kind: "example", type: shot.type, card: shot.card, poster: shot.poster }, { play: "hover" });
-            previewHost.replaceChildren(media);
-            hoverPlay(previewHost, media._video);
-          } else {
-            previewHost.hidden = true;
-          }
-        }
-      };
-      fieldUpdaters.push(sync);
-      sync();
-      return el("div", { class: "field" }, lbl, previewHost, rowBtn, help);
-    }
-
-    return null;
-  }
-
-  // Build Sidebar layout left column
-  function buildSidebar() {
-    const side = el("aside", { class: "side" });
-
-    // Video studio tabs
-    const vtab = videoTabOf(app.id);
-    if (vtab) {
-      side.append(el("div", { class: "side-tabs", role: "tablist" }, ...VIDEO_TABS.map((tab) => {
-        const first = tab.apps.map((id) => byId.get(id)).find(Boolean);
-        return el("button", {
-          type: "button",
-          role: "tab",
-          "aria-selected": String(tab.id === vtab),
-          onclick: () => { if (first && tab.id !== vtab) location.hash = `#/app/${first.id}`; },
-        }, t(`vtab.${tab.id}`));
-      })));
-    }
-
-    const scroll = el("div", { class: "side-scroll" });
-
-    // Model/app card with Change button
-    const ex = exampleItem(app);
-    const cardMedia = ex ? thumb(ex, { play: "hover" }) : el("div", { class: "media" });
-    const modelCard = el("div", { class: "model-card", onclick: (e) => openSwitcher(e.currentTarget) },
-      cardMedia,
-      el("button", { class: "change", type: "button", onclick: (e) => { e.stopPropagation(); openSwitcher(e.currentTarget); } }, icon("swap"), t("ws.change")),
-      el("div", { class: "txt" }, el("h3", { class: "display" }, app.name), el("p", {}, tagline(app))));
-    hoverPlay(modelCard, cardMedia._video);
-    scroll.append(modelCard);
-
-    const modes = modesSwitch();
-    if (modes) scroll.append(modes);
-
-    const basic = app.inputs.filter((i) => !isAdvanced(i));
-    const adv = app.inputs.filter((i) => isAdvanced(i));
-    for (const inp of basic) {
-      const f = buildField(inp);
-      if (f) scroll.append(f);
-    }
-
-    // Presets
-    if (app.presets?.length) {
-      const seg = el("div", { class: "seg" });
-      const allPresets = [{ id: null, label: t("ws.preset.none") }, ...app.presets];
-      const btns = allPresets.map((p) => el("button", { type: "button", onclick: () => { preset = p.id; refreshFields(); } }, p.label));
-      seg.append(...btns);
-      const sync = () => allPresets.forEach((p, i) => btns[i].setAttribute("aria-pressed", String(preset === p.id)));
-      fieldUpdaters.push(sync);
-      sync();
-      scroll.append(el("div", { class: "field" }, el("div", { class: "lbl" }, el("span", {}, t("ws.preset"))), seg));
-    }
-
-    if (adv.length) {
-      scroll.append(el("details", { class: "adv" },
-        el("summary", {}, t("ws.advanced"), el("span", { class: "i-chev" }, icon("chevD"))),
-        el("div", { class: "in" }, ...adv.map(buildField).filter(Boolean))));
-    }
-
-    const needBanner = needNode(app);
-    const foot = el("div", { class: "side-foot" },
-      needBanner ? el("p", { class: "side-note" }, needBanner) : null,
-      noteEl,
-      el("div", { class: "row" }, batchCounter(), generateButton()));
-
-    side.append(scroll, foot);
-    return side;
-  }
-
-  // Build Floating Composer bar (prompt-first image & audio apps)
+  // ------------------------------------------------------------------ Composer layout (prompt-first image & audio)
   function buildComposer() {
-    const pIn = promptInput(app);
-    const fileInputs = app.inputs.filter((i) => isMedia(i.type));
-    const otherInputs = app.inputs.filter((i) => i !== pIn && !isMedia(i.type));
-    const basicChips = otherInputs.filter((i) => !isAdvanced(i));
-    const advChips = otherInputs.filter((i) => isAdvanced(i));
+    const pInp = promptInput(app);
+    const fileInputs = app.inputs.filter(isFile);
+    const primarySelects = app.inputs.filter((i) => !isFile(i) && i !== pInp && (i.type === "select" || i.gallery));
+    const advInputs = app.inputs.filter((i) => !isFile(i) && i !== pInp && !primarySelects.includes(i));
+    const ex = exampleItem(app);
 
-    const attachBox = el("div", { class: "cmp-attach" });
-    for (const inp of fileInputs) {
-      const fileIn = el("input", { type: "file", accept: acceptOf(inp.type), hidden: true });
-      fileIn.addEventListener("change", () => { if (fileIn.files?.[0]) setFile(inp.id, fileIn.files[0]); fileIn.value = ""; });
-      const slot = el("div", { class: "att need", role: "button", tabindex: "0", title: inp.label, onclick: () => fileIn.click() });
-      missingEls.set(inp.id, slot);
-      const sync = () => {
-        const f = files.get(inp.id), u = fileUrls.get(inp.id);
-        slot.className = f ? "att" : "att need";
-        if (f && u) {
-          slot.replaceChildren(
-            inp.type === "video" ? el("video", { src: u, muted: true }) : el("img", { src: u, alt: f.name }),
-            el("button", { class: "x", type: "button", onclick: (e) => { e.stopPropagation(); setFile(inp.id, null); } }, "×"),
-            el("span", { class: "lbl" }, inp.label),
-            fileIn);
-        } else {
-          slot.replaceChildren(icon("plus"), el("span", { class: "lbl" }, inp.label), fileIn);
-        }
-      };
-      fieldUpdaters.push(sync);
-      sync();
-      attachBox.append(slot);
-    }
-
-    const ta = el("textarea", {
+    const ta = pInp ? el("textarea", {
       class: "cmp-prompt",
-      rows: "2",
-      placeholder: pIn?.default ? t("ws.eg", { x: String(pIn.default) }) : t("ws.prompt.ph"),
-      value: pIn ? String(values[pIn.id] ?? "") : "",
-    });
-    if (pIn) {
-      missingEls.set(pIn.id, ta);
-      ta.addEventListener("input", () => { values[pIn.id] = ta.value; ta.classList.remove("missing"); });
-      ta.addEventListener("keydown", (e) => { if ((e.metaKey || e.ctrlKey) && e.key === "Enter") { e.preventDefault(); submitRun(); } });
-      fieldUpdaters.push(() => { if (ta.value !== String(values[pIn.id] ?? "")) ta.value = String(values[pIn.id] ?? ""); });
+      placeholder: pInp.required ? t("ws.prompt.ph") : t("ws.prompt.opt", { label: pInp.label }),
+      value: values[pInp.id] ?? "",
+      oninput: () => { values[pInp.id] = ta.value; },
+      onkeydown: (e) => { if ((e.metaKey || e.ctrlKey) && e.key === "Enter") { e.preventDefault(); submitRun(); } },
+    }) : null;
+    if (pInp) fieldUpdaters.set(pInp.id, () => { ta.value = String(values[pInp.id] ?? ""); });
+
+    const attachRow = fileInputs.length ? el("div", { class: "cmp-attach" }) : null;
+    if (attachRow) {
+      const drawAttach = () => {
+        attachRow.replaceChildren(...fileInputs.map((inp) => {
+          const f = files[inp.id];
+          const url = previews.get(inp.id);
+          const fileIn = el("input", {
+            type: "file", hidden: true,
+            accept: inp.type === "video" ? "video/*" : inp.type === "audio" ? "audio/*" : "image/*",
+            onchange: () => { if (fileIn.files?.[0]) setFile(inp.id, fileIn.files[0]); fileIn.value = ""; },
+          });
+          if (f && url) {
+            return el("div", { class: "att" },
+              inp.type === "video" ? el("video", { src: url, muted: true }) : el("img", { src: url, alt: f.name }),
+              el("span", { class: "lbl" }, inp.label),
+              el("button", { class: "x", type: "button", title: t("ws.remove"), onclick: () => setFile(inp.id, null) }, "×"));
+          }
+          return el("button", {
+            class: "att need", type: "button", title: t("ws.add", { what: inp.label }),
+            onclick: () => fileIn.click(),
+          }, "+", el("span", { class: "lbl" }, inp.label), fileIn);
+        }));
+      };
+      for (const inp of fileInputs) fieldUpdaters.set(inp.id, drawAttach);
+      drawAttach();
     }
 
-    // Model switcher chip
-    const ex = app.example;
-    const thSrc = ex?.poster || (ex && ex.type !== "video" ? ex.card : null);
-    const modelChip = el("button", { class: "chip model", type: "button", onclick: (e) => openSwitcher(e.currentTarget) },
-      el("span", { class: "thumb" }, thSrc ? el("img", { src: thSrc, alt: "" }) : icon(iconOf(app))),
-      el("span", { class: "v" }, app.name),
-      icon("chevD"));
+    const fam = familyOf(app);
+    const modelBtn = el("button", {
+      class: "chip model", type: "button",
+      onclick: () => fam.length > 1 && openFamilyPicker(modelBtn),
+    },
+    el("span", { class: "thumb" }, ex ? thumb(ex, { play: "none" }) : icon(iconOf(app))),
+    el("span", { class: "v" }, app.name),
+    fam.length > 1 ? icon("chev") : null);
 
-    const makeChip = (inp) => {
-      if (inp.type === "toggle") {
-        const b = el("button", { class: "chip", type: "button", onclick: () => { values[inp.id] = !values[inp.id]; refreshFields(); } }, inp.label);
-        const sync = () => b.classList.toggle("on", Boolean(values[inp.id]));
-        fieldUpdaters.push(sync);
-        sync();
-        return b;
-      }
-      if (inp.type === "select") {
-        const val = el("span", { class: "v" });
-        const b = el("button", { class: "chip", type: "button", onclick: (e) => openSelectPopover(e.currentTarget, inp) },
-          el("span", { class: "k" }, inp.label), val);
-        const sync = () => { val.textContent = selectLabel(inp); b.classList.toggle("filled", Boolean(values[inp.id] && (!Array.isArray(values[inp.id]) || values[inp.id].length))); };
-        fieldUpdaters.push(sync);
-        sync();
-        return b;
-      }
-      if (inp.type === "slider" || inp.type === "number") {
-        const val = el("span", { class: "v" });
-        const b = el("button", { class: "chip", type: "button", onclick: (e) => {
-          const min = inp.min ?? 0, max = inp.max ?? 100, step = inp.step ?? 1;
-          const r = el("input", { type: "range", min: String(min), max: String(max), step: String(step), value: String(values[inp.id]) });
-          const num = el("b", {}, String(values[inp.id]));
-          r.addEventListener("input", () => { values[inp.id] = Number(r.value); num.textContent = r.value; refreshFields(); });
-          popover(e.currentTarget, el("div", { class: "pad" }, el("div", { class: "range" }, el("div", { class: "top" }, el("span", {}, inp.label), num), r), inp.help ? el("p", { class: "help" }, inp.help) : null));
-        } }, el("span", { class: "k" }, inp.label), val);
-        const sync = () => { val.textContent = String(values[inp.id]); };
-        fieldUpdaters.push(sync);
-        sync();
-        return b;
-      }
-      if (inp.type === "textarea" || inp.type === "text") {
-        const b = el("button", { class: "chip", type: "button", onclick: (e) => {
-          const box = el("textarea", { value: String(values[inp.id] ?? ""), placeholder: inp.default ? t("ws.eg", { x: String(inp.default) }) : "" });
-          box.addEventListener("input", () => { values[inp.id] = box.value; refreshFields(); });
-          popover(e.currentTarget, el("div", { class: "pad" }, el("h4", {}, inp.label), box, inp.help ? el("p", { class: "help" }, inp.help) : null), { width: 340 });
-        } }, el("span", { class: "k" }, inp.label));
-        const sync = () => b.classList.toggle("filled", Boolean(String(values[inp.id] ?? "").trim()));
-        fieldUpdaters.push(sync);
-        sync();
-        return b;
-      }
-      return null;
-    };
+    const chips = [modelBtn, modesSwitch()];
 
-    const advBtn = advChips.length ? el("button", {
-      class: "chip square",
-      type: "button",
-      title: t("ws.advanced"),
-      "aria-label": t("ws.advanced"),
-      onclick: (e) => popover(e.currentTarget, el("div", { class: "pad", style: { width: "300px" } }, ...advChips.map(buildField).filter(Boolean)), { align: "end" }),
-    }, icon("sliders")) : null;
+    if (app.presets?.length) {
+      const pVal = el("span", { class: "v" });
+      const pBtn = el("button", {
+        class: "chip", type: "button",
+        onclick: () => popover(pBtn, el("div", {},
+          el("h4", {}, t("ws.preset")),
+          el("button", { class: "opt", type: "button", "aria-selected": String(!presetId), onclick: () => { presetId = null; closePopover(); syncPreset(); } }, t("ws.preset.none"), el("span", { class: "chk" }, icon("check"))),
+          ...app.presets.map((p) => el("button", {
+            class: "opt", type: "button", "aria-selected": String(presetId === p.id),
+            onclick: () => { presetId = p.id; closePopover(); syncPreset(); },
+          }, p.label, el("span", { class: "chk" }, icon("check")))))),
+      }, el("span", { class: "k" }, t("ws.preset")), pVal, icon("chev"));
+      const syncPreset = () => {
+        const cur = app.presets.find((p) => p.id === presetId);
+        pVal.textContent = cur ? cur.label : t("ws.preset.none");
+        pBtn.classList.toggle("on", Boolean(cur));
+      };
+      syncPreset();
+      fieldUpdaters.set("__preset", syncPreset);
+      chips.push(pBtn);
+    }
+
+    for (const inp of primarySelects.slice(0, 4)) {
+      const vSpan = el("span", { class: "v" });
+      const cBtn = el("button", {
+        class: "chip", type: "button",
+        onclick: () => openSelectPopover(cBtn, inp, syncChip),
+      }, el("span", { class: "k" }, inp.label), vSpan, icon("chev"));
+      const syncChip = () => {
+        vSpan.textContent = selectDisplay(inp);
+        cBtn.classList.toggle("filled", Boolean(values[inp.id] && (!Array.isArray(values[inp.id]) || values[inp.id].length)));
+      };
+      syncChip();
+      fieldUpdaters.set(inp.id, syncChip);
+      chips.push(cBtn);
+    }
+
+    const extraAdv = [...primarySelects.slice(4), ...advInputs];
+    if (extraAdv.length) {
+      const advBtn = el("button", {
+        class: "chip square", type: "button", title: t("ws.advanced"), "aria-label": t("ws.advanced"),
+        onclick: () => popover(advBtn, el("div", { class: "pad", style: { width: "320px" } },
+          el("h4", { style: { margin: 0 } }, t("ws.advanced")),
+          ...extraAdv.map((i) => renderFieldControl(i, { compact: true })))),
+      }, icon("sliders"));
+      chips.push(advBtn);
+    }
+
+    const runStatus = canRun();
+    const hint = runStatus.reason ? el("div", { class: "cmp-hint err" }, runStatus.reason) : null;
 
     const composer = el("div", { class: "composer" },
-      el("div", { class: "cmp-top" }, fileInputs.length ? attachBox : null, ta),
-      el("div", { class: "cmp-row" },
-        modelChip,
-        modesSwitch(),
-        ...basicChips.map(makeChip).filter(Boolean),
-        advBtn,
-        el("span", { class: "grow" }),
-        batchCounter(),
-        generateButton()),
-      needNode(app) ? el("div", { class: "cmp-hint" }, needNode(app)) : null,
-      noteEl);
+      el("div", { class: "cmp-top" }, attachRow, ta),
+      el("div", { class: "cmp-row" }, ...chips.filter(Boolean), el("span", { class: "grow" }), countControl(), generateButton()),
+      hint);
 
-    if (fileInputs.length) {
-      composer.addEventListener("dragover", (e) => { e.preventDefault(); composer.classList.add("drag"); });
-      composer.addEventListener("dragleave", () => composer.classList.remove("drag"));
-      composer.addEventListener("drop", (e) => {
-        e.preventDefault();
-        composer.classList.remove("drag");
-        const f = e.dataTransfer.files?.[0];
-        if (f) setFile(fileInputs[0].id, f);
-      });
-    }
+    composer.addEventListener("dragover", (e) => { e.preventDefault(); composer.classList.add("drag"); });
+    composer.addEventListener("dragleave", () => composer.classList.remove("drag"));
+    composer.addEventListener("drop", (e) => {
+      e.preventDefault();
+      composer.classList.remove("drag");
+      const f = e.dataTransfer.files?.[0];
+      if (f && fileInputs[0]) setFile(fileInputs[0].id, f);
+    });
+
     return composer;
   }
 
-  // Empty history hero
-  function buildEmptyHistory() {
+  // ------------------------------------------------------------------ Sidebar layout (video & tools)
+  function buildSidebar() {
+    const ex = exampleItem(app);
+    const fam = familyOf(app);
+    const vTab = videoTabOf(app.id);
+
+    const sideTabs = vTab ? el("div", { class: "side-tabs" }, ...VIDEO_TABS.map((tab) =>
+      el("button", {
+        type: "button", "aria-selected": String(tab.id === vTab),
+        onclick: () => { if (tab.apps[0]) location.hash = `#/app/${tab.apps[0]}`; },
+      }, t(`vtab.${tab.id}`)))) : null;
+
+    const modelCard = el("div", {
+      class: "model-card", tabindex: "0", role: "button",
+      onclick: () => fam.length > 1 && openFamilyPicker(modelCard),
+      onkeydown: (e) => { if (e.key === "Enter" && fam.length > 1) openFamilyPicker(modelCard); },
+    },
+    ex ? thumb(ex, { play: "hover" }) : el("div", { class: "media" }),
+    fam.length > 1 ? el("span", { class: "change" }, t("ws.change"), icon("chev")) : null,
+    el("div", { class: "txt" },
+      el("h3", { class: "display" }, app.name),
+      el("p", {}, tagline(app))));
+    hoverPlay(modelCard, modelCard.querySelector("video"));
+
+    const primary = [];
+    const advanced = [];
+    for (const inp of app.inputs) {
+      if (isFile(inp) || inp.required || inp.type === "textarea" || inp.gallery) primary.push(inp);
+      else advanced.push(inp);
+    }
+
+    const presetField = app.presets?.length ? (() => {
+      const seg = el("div", { class: "seg" });
+      const sync = () => {
+        seg.replaceChildren(
+          el("button", { type: "button", "aria-pressed": String(!presetId), onclick: () => { presetId = null; sync(); } }, t("ws.preset.none")),
+          ...app.presets.map((p) => el("button", {
+            type: "button", "aria-pressed": String(presetId === p.id),
+            onclick: () => applyPreset(p),
+          }, p.label)));
+      };
+      sync();
+      fieldUpdaters.set("__preset", sync);
+      return el("div", { class: "field" }, el("div", { class: "lbl" }, t("ws.preset")), seg);
+    })() : null;
+
+    const advDetails = advanced.length ? el("details", { class: "adv" },
+      el("summary", {}, t("ws.advanced"), icon("chev")),
+      el("div", { class: "in" }, ...advanced.map((i) => renderFieldControl(i)))) : null;
+
+    const runStatus = canRun();
+
+    return el("aside", { class: "side" },
+      sideTabs,
+      el("div", { class: "side-scroll" },
+        modelCard,
+        modesSwitch(),
+        ...primary.map((i) => renderFieldControl(i)),
+        presetField,
+        advDetails),
+      el("div", { class: "side-foot" },
+        el("div", { class: "row" }, countControl(), generateButton({ wide: true })),
+        runStatus.reason ? el("p", { class: "side-note err" }, runStatus.reason) : null));
+  }
+
+  // ------------------------------------------------------------------ Main area (History / Lab Example / How it works)
+  let stopFeed = null;
+
+  function emptyHistoryState() {
     const ex = exampleItem(app);
     if (layout === "composer") {
       return el("div", { class: "feed-empty" },
         el("div", {},
-          el("div", { class: "glass" }, logoMark()),
-          el("h2", { class: "display" }, el("span", {}, t("ws.create.title")), app.name),
-          app.summary ? el("p", {}, app.summary) : null,
-          ex ? el("button", { class: "ex", type: "button", onclick: loadLabExample },
+          el("div", { class: "glass" }, icon(iconOf(app))),
+          el("h2", { class: "display" }, t("ws.create.title"), el("span", {}, app.name)),
+          el("p", {}, app.summary || tagline(app)),
+          ex ? el("button", { class: "ex", type: "button", onclick: () => applyExample(ex) },
             thumb(ex, { play: "none" }),
-            el("div", {}, el("b", {}, t("ws.useex")), el("small", {}, ex.seconds ? fmtSeconds(ex.seconds) : tagline(app)))) : null));
+            el("div", {}, el("b", {}, t("ws.example")), el("small", {}, t("ws.useex")))) : null));
     }
 
-    // Sidebar empty hero + "More like this"
-    const wrap = el("div", { style: { display: "grid", gap: "22px" } });
-    const flow = ex ? el("div", { class: "flow" },
-      ex.inputs.length ? el("div", { class: "ins" }, ...ex.inputs.slice(0, 3).map((inp) =>
-        el("div", { class: "media" }, inp.thumb ? el("img", { src: inp.thumb, alt: inp.label }) : icon(inp.type === "video" ? "video" : "image")))) : null,
-      ex.inputs.length ? el("span", { class: "arrow" }, icon("chevR")) : null,
-      el("div", { class: "out" }, thumb(ex, { play: "visible" }))) : null;
-
-    wrap.append(el("div", { class: "ws-hero" },
+    return el("div", { class: "ws-hero" },
       el("div", {},
-        el("h1", { class: "display" }, tagline(app)),
-        app.summary ? el("p", {}, app.summary) : null,
+        el("h1", { class: "display" }, app.name),
+        el("p", {}, app.summary || tagline(app)),
         el("div", { class: "row" },
-          ex ? el("button", { class: "btn lime", type: "button", onclick: loadLabExample }, icon("redo"), t("ws.useex")) : null,
-          el("button", { class: "btn ghost", type: "button", onclick: () => { activeTab = "how"; drawMain(); } }, icon("info"), t("ws.how")))),
-      flow));
-
-    const related = familyOf(app).filter((a) => a.id !== app.id && a.example?.full).slice(0, 12);
-    if (related.length) {
-      const relItems = related.map(exampleItem).filter(Boolean);
-      const grid = el("div", {});
-      const cards = related.map((a) => {
-        const it = exampleItem(a);
-        const media = thumb(it, { play: "hover" });
-        const card = el("a", { class: "m-item", href: `#/app/${a.id}` },
-          media,
-          el("div", { class: "cap" }, el("span", {}, a.name)));
-        hoverPlay(card, media._video);
-        return card;
-      });
-      wrap.append(el("h2", { class: "display", style: { margin: "4px 0 0", fontSize: "22px" } }, t("ws.related")), grid);
-      cleanups.push(masonry(grid, cards, { min: 220, gap: 12 }));
-      void relItems;
-    }
-    return wrap;
+          ex ? el("button", { class: "btn lime", type: "button", onclick: () => applyExample(ex) }, icon("spark"), t("ws.useex")) : null,
+          el("button", { class: "btn ghost", type: "button", onclick: () => { activeTab = "how"; drawMain(); } }, t("ws.how")))),
+      ex ? el("div", { class: "flow" },
+        ex.inputs?.length ? el("div", { class: "ins" }, ...ex.inputs.slice(0, 2).map((inp) =>
+          el("div", { class: "media" }, inp.play
+            ? el("video", { src: `${inp.play}#t=0.1`, muted: true, preload: "metadata" })
+            : el("img", { src: inp.thumb || inp.file, alt: inp.label })))) : null,
+        ex.inputs?.length ? el("span", { class: "arrow" }, icon("arrow")) : null,
+        el("div", { class: "out" }, thumb(ex, { play: "visible" }))) : null);
   }
 
-  // Main right-hand panel (History / Library / How it works)
-  const mainPanel = el("div", { class: "ws-main" });
-  const tabsEl = el("div", { class: "tabs", role: "tablist" });
-  const denseBtn = el("button", {
-    class: "icon-btn",
-    type: "button",
-    title: t("ws.dense"),
-    "aria-label": t("ws.dense"),
-    onclick: () => { dense = !dense; store.set("ws.dense", dense); drawMain(); },
-  }, icon(dense ? "rows" : "grid"));
-  const topRow = el("div", { class: "ws-top" }, tabsEl, el("div", { class: "right" }, denseBtn));
-  const stage = el("div", { style: { flex: "1", display: "flex", flexDirection: "column" } });
-  mainPanel.append(topRow, stage);
+  async function applyExample(ex) {
+    if (!ex) return;
+    Object.assign(values, ex.values || {});
+    if (ex.seed != null && app.inputs.some((i) => i.id === "seed")) values.seed = ex.seed;
+    for (const fn of fieldUpdaters.values()) fn();
+    if (ex.inputs?.length) {
+      await Promise.all(ex.inputs.map(async (inp) => {
+        if (!inp.file) return;
+        try {
+          const f = await fetchAsFile(inp.file, inp.id);
+          setFile(inp.id, f);
+        } catch { /* ignore */ }
+      }));
+    }
+    toast(t("toast.loaded", { app: app.name }));
+  }
 
-  let disposeTab = null;
+  function renderLabTab() {
+    const ex = exampleItem(app);
+    if (!ex) return el("div", { class: "empty" }, t("explore.noex"));
+    const labelMap = Object.fromEntries(app.inputs.map((i) => [i.id, i.label]));
+    const vals = Object.entries(ex.values || {});
+    return el("div", { class: "ex-big" },
+      el("div", { class: "stage" },
+        ex.type === "video"
+          ? el("video", { src: ex.full, poster: ex.poster, controls: true, loop: true, playsinline: true })
+          : ex.type === "audio"
+            ? el("div", { class: "audio-box" }, el("audio", { src: ex.full, controls: true }))
+            : el("img", { src: ex.full, alt: app.name })),
+      el("div", { class: "side2" },
+        el("div", { style: { display: "flex", gap: "8px", flexWrap: "wrap" } },
+          el("button", { class: "btn lime", type: "button", onclick: () => applyExample(ex) }, icon("spark"), t("ws.useex")),
+          flagButton(flags.key(app.id))),
+        ex.inputs?.length ? el("div", { class: "ins-row" }, ...ex.inputs.map((inp) =>
+          el("figure", {},
+            el("div", { class: "media" }, inp.play
+              ? el("video", { src: `${inp.play}#t=0.1`, muted: true, preload: "metadata" })
+              : el("img", { src: inp.thumb || inp.file, alt: inp.label })),
+            el("figcaption", {}, inp.label)))) : null,
+        vals.length ? el("dl", { class: "vals" }, ...vals.flatMap(([k, v]) => [
+          el("dt", {}, labelMap[k] || k),
+          el("dd", {}, Array.isArray(v) ? v.join(", ") : String(v)),
+        ])) : null));
+  }
+
+  function renderHowTab() {
+    const totalGb = app.models.reduce((acc, m) => acc + (m.optional ? 0 : m.gb || 0), 0);
+    const fit = fitOf(app);
+    return el("div", { class: "how-grid" },
+      el("div", { class: "card" },
+        el("h3", {}, icon("layers"), t("how.pipeline")),
+        el("p", {}, t("how.pipeline.d", { id: app.id })),
+        app.higgsfield_feature ? el("p", {}, el("b", {}, `${t("how.equiv")}: `), app.higgsfield_feature) : null,
+        app.workflowPath !== null ? el("div", {},
+          el("a", { class: "btn small", href: `/api/apps/${app.id}/workflow`, download: `spacix-${app.id}.json` },
+            icon("download"), t("how.workflow")),
+          el("p", { style: { marginTop: "8px" } }, t("how.workflow.d"))) : null),
+
+      el("div", { class: "card" },
+        el("h3", {}, icon("download"), t("how.models")),
+        el("p", {}, `${t("how.pack")}: `, el("b", {}, app.pack), totalGb > 0 ? ` · ${t("how.total", { gb: totalGb.toFixed(1) })}` : ""),
+        el("table", { class: "models" }, ...app.models.map((m) => el("tr", {},
+          el("td", {},
+            el("div", {}, m.name),
+            el("small", { class: "dim" }, m.repo, m.gated ? ` · ${t("how.gated")}` : "", m.optional ? ` · ${t("how.optional")}` : "")),
+          el("td", { class: "r" }, `${m.gb} ${t("unit.gb")}`))))),
+
+      app.vram ? el("div", { class: "card" },
+        el("h3", {}, icon("chip"), t("how.vram")),
+        fit ? el("span", { class: `fit ${fit[1]}` }, t(fit[0])) : null,
+        el("dl", { class: "vals" },
+          el("dt", {}, t("how.whole")), el("dd", {}, `${app.vram.whole_gb} ${t("unit.gb")}`),
+          el("dt", {}, t("how.phase")), el("dd", {}, `${app.vram.largest_phase_gb} ${t("unit.gb")}`),
+          app.vram.measured_gb ? el("dt", {}, t("how.measured")) : null,
+          app.vram.measured_gb ? el("dd", {}, `${app.vram.measured_gb} ${t("unit.gb")}`) : null)) : null,
+
+      el("div", { class: "card" },
+        el("h3", {}, icon("code"), t("how.cli")),
+        el("pre", { class: "code" }, `npm run app -- ${app.id}`),
+        app.credits?.length ? el("div", {},
+          el("h3", { style: { marginTop: "6px" } }, t("how.credits")),
+          ...app.credits.map((c) => el("p", {}, c))) : null,
+        app.notes ? el("p", {}, el("b", {}, `${t("how.notes")}: `), app.notes) : null));
+  }
+
   function drawMain() {
-    disposeTab?.();
-    disposeTab = null;
-    denseBtn.replaceChildren(icon(dense ? "rows" : "grid"));
-    tabsEl.replaceChildren(
-      ...[["history", "clock", t("ws.history")], ["library", "film", t("ws.library")], ["how", "info", t("ws.how")]].map(([id, ic, label]) =>
-        el("button", { type: "button", role: "tab", "aria-selected": String(activeTab === id), onclick: () => { activeTab = id; drawMain(); } }, icon(ic), label)));
+    stopFeed?.();
+    stopFeed = null;
+
+    const tabs = el("div", { class: "tabs" }, ...[
+      ["history", t("ws.history")],
+      ["lab", t("ws.library")],
+      ["how", t("ws.how")],
+    ].map(([id, label]) => el("button", {
+      type: "button", "aria-selected": String(activeTab === id),
+      onclick: () => { activeTab = id; drawMain(); },
+    }, label)));
+
+    const right = activeTab === "history" ? el("div", { class: "right" },
+      el("label", { style: { display: "inline-flex", alignItems: "center", gap: "8px", fontSize: "12.5px", color: "var(--dim)", cursor: "pointer" } },
+        t("ws.dense"),
+        el("span", { class: "switch" },
+          el("input", { type: "checkbox", checked: dense, onchange: (e) => { dense = e.target.checked; drawMain(); } }),
+          el("i")))) : null;
+
+    const top = el("div", { class: "ws-top" }, tabs, right);
+    const content = el("div", { style: { flex: 1, display: "flex", flexDirection: "column" } });
 
     if (activeTab === "history") {
-      const host = el("div", { style: { flex: "1", display: "flex", flexDirection: "column" } });
-      stage.replaceChildren(host);
-      disposeTab = feedView(host, { app: app.id, dense, empty: buildEmptyHistory });
-    } else if (activeTab === "library") {
-      stage.replaceChildren(buildLibraryTab(app, loadLabExample, (inpId, val) => {
-        values[inpId] = val;
-        refreshFields();
-        activeTab = "history";
-        drawMain();
-      }));
+      stopFeed = feedView(content, { app: app.id, empty: emptyHistoryState(), dense });
+    } else if (activeTab === "lab") {
+      content.replaceChildren(renderLabTab());
     } else {
-      stage.replaceChildren(buildHowTab(app));
+      content.replaceChildren(renderHowTab());
     }
+
+    mainBody.replaceChildren(top, content);
   }
-
-  // Global paste support for the first image input
-  const onPaste = (e) => {
-    const firstImg = app.inputs.find((i) => i.type === "image" && !i.paint);
-    if (!firstImg) return;
-    const item = [...(e.clipboardData?.items || [])].find((it) => it.type.startsWith("image/"));
-    if (item) {
-      const f = item.getAsFile();
-      if (f) setFile(firstImg.id, f);
-    }
-  };
-  document.addEventListener("paste", onPaste);
-
-  const ws = el("div", { class: `ws l-${layout}` });
-  if (layout === "sidebar") ws.append(buildSidebar(), mainPanel);
-  else ws.append(mainPanel, buildComposer());
 
   drawMain();
+  cleanups.push(() => stopFeed?.());
 
-  activeController = { app, load: loadPayload };
-  if (pendingLoad && pendingLoad.appId === app.id) {
-    const p = pendingLoad;
-    pendingLoad = null;
-    void loadPayload(p);
+  // Re-evaluate needs if models status updates
+  const offModels = models.listeners ? (() => {
+    const fn = () => {};
+    models.listeners.add(fn);
+    return () => models.listeners.delete(fn);
+  })() : null;
+  if (offModels) cleanups.push(offModels);
+
+  // Hydrate any pending files (recreate / useIn / example)
+  if (loadJob?.inputs?.length) {
+    Promise.all(loadJob.inputs.map(async (inp) => {
+      if (!inp.file) return;
+      try {
+        const f = await fetchAsFile(inp.file, inp.name || inp.id);
+        setFile(inp.id, f);
+      } catch { /* ignore */ }
+    })).then(() => {
+      if (loadJob.run) submitRun();
+    });
+  } else if (loadJob?.run) {
+    queueMicrotask(() => submitRun());
   }
 
+  // Paste image support on the workspace
+  const onPaste = (e) => {
+    const fileItem = [...(e.clipboardData?.items || [])].find((it) => it.kind === "file" && it.type.startsWith("image/"));
+    if (!fileItem) return;
+    const targetInput = app.inputs.find((i) => i.type === "image" && !i.paint);
+    if (!targetInput) return;
+    const f = fileItem.getAsFile();
+    if (f) setFile(targetInput.id, f);
+  };
+  document.addEventListener("paste", onPaste);
+  cleanups.push(() => document.removeEventListener("paste", onPaste));
+
+  const root = layout === "composer"
+    ? el("div", { class: "ws l-composer" },
+      el("div", { class: "ws-main" }, mainBody),
+      buildComposer())
+    : el("div", { class: "ws l-sidebar" },
+      buildSidebar(),
+      el("div", { class: "ws-main" }, mainBody));
+
   return {
-    node: ws,
+    node: root,
     app,
-    dispose: () => {
-      if (activeController?.app === app) activeController = null;
-      disposeTab?.();
-      cleanups.forEach((fn) => fn?.());
-      document.removeEventListener("paste", onPaste);
-      for (const u of fileUrls.values()) URL.revokeObjectURL(u);
-      fileUrls.clear();
-    },
+    dispose: () => cleanups.forEach((fn) => fn()),
   };
 }
