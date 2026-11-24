@@ -1,0 +1,5 @@
+{
+  "name": "Freefield",
+  "description": "Open-source Higgsfield on ComfyUI: every app is one folder, every model is open weights.",
+  "requestFramePermissions": []
+}

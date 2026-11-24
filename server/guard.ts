@@ -1,0 +1,237 @@
+// What a hosted Freefield allows: a passcode at the door and a cap on runs. Off unless configured.
+//   FREEFIELD_PASSCODE          every request needs it: once as ?key=… (it becomes a cookie), or the form at /
+//   FREEFIELD_MAX_RUNS_PER_DAY  runs started per UTC day across all visitors (counted in <out>/limits.json)
+//   FREEFIELD_MAX_ACTIVE        runs going at the same time
+// Running locally with none of these set, nothing changes.
+// With a passcode, every visitor also gets their own id (cookie ff_vid): the history shows each one only their runs.
+// Always on, hosted or not, `foreign()` turns away requests from other sites: a page you visit cannot start runs on
+// your GPU through your browser (cross-site POST to 127.0.0.1:3000), nor read the API by rebinding its DNS name to it.
+//   FREEFIELD_ALLOWED_HOSTS     extra Host names to accept, comma-separated (a LAN name, a tunnel); local default is
+//                               localhost, 127.0.0.1 and [::1]; listening on a non-loopback address accepts any Host
+//   FREEFIELD_SHARED_HISTORY=1  one owner behind the passcode (your own pod on RunPod or Vast): every browser that has
+//                               the passcode sees the same history, as locally, instead of one history per visitor
+import { createHmac, randomBytes, timingSafeEqual } from "node:crypto";
+import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { isIP } from "node:net";
+import { dirname } from "node:path";
+
+export type GuardOptions = {
+  passcode?: string;
+  maxRunsPerDay?: number;
+  maxActive?: number;
+  stateFile?: string;
+  now?: () => Date;
+  /** every visitor with the passcode sees one shared history (a pod of your own), instead of one each (a public demo) */
+  sharedHistory?: boolean;
+};
+
+const COOKIE = "ff_key";
+const VISITOR = "ff_vid";
+const VISITOR_ID = /^[0-9a-f]{32}$/;
+const MONTH = 60 * 60 * 24 * 30;
+const LOOPBACK = new Set(["localhost", "127.0.0.1", "[::1]", "::1"]);
+
+export class Guard {
+  readonly passcode?: string;
+  readonly maxRunsPerDay?: number;
+  readonly maxActive?: number;
+  readonly sharedHistory: boolean;
+  private readonly stateFile?: string;
+  private readonly now: () => Date;
+  private readonly cookieValue?: string;
+  private state: { day: string; runs: number };
+
+  constructor(opts: GuardOptions = {}) {
+    this.passcode = opts.passcode || undefined;
+    this.maxRunsPerDay = opts.maxRunsPerDay && opts.maxRunsPerDay > 0 ? opts.maxRunsPerDay : undefined;
+    this.maxActive = opts.maxActive && opts.maxActive > 0 ? opts.maxActive : undefined;
+    this.sharedHistory = Boolean(opts.sharedHistory);
+    this.stateFile = opts.stateFile;
+    this.now = opts.now ?? (() => new Date());
+    // the cookie holds a keyed hash of the passcode, never the passcode itself
+    this.cookieValue = this.passcode ? createHmac("sha256", this.passcode).update("freefield-visitor").digest("hex") : undefined;
+    this.state = this.load();
+  }
+
+  static fromEnv(stateFile: string, env: NodeJS.ProcessEnv = process.env): Guard {
+    const num = (v?: string) => (v && /^\d+$/.test(v) ? Number(v) : undefined);
+    return new Guard({ passcode: env.FREEFIELD_PASSCODE, maxRunsPerDay: num(env.FREEFIELD_MAX_RUNS_PER_DAY),
+      maxActive: num(env.FREEFIELD_MAX_ACTIVE), stateFile, sharedHistory: env.FREEFIELD_SHARED_HISTORY === "1" });
+  }
+
+  get hosted(): boolean {
+    return Boolean(this.passcode || this.maxRunsPerDay || this.maxActive);
+  }
+
+  /** Does this request carry the passcode (as the cookie)? Always true without a passcode. */
+  admits(cookieHeader: string | undefined): boolean {
+    if (!this.cookieValue) return true;
+    const got = parseCookies(cookieHeader)[COOKIE];
+    return Boolean(got) && same(got, this.cookieValue);
+  }
+
+  /**
+   * A correct ?key= becomes the cookie; the caller redirects to the same URL without it. `secure` false only for plain
+   * http to a bare IP address (a Vast.ai port): browsers drop a Secure cookie there and the door would never open.
+   */
+  login(key: string | null, secure = true): string | null {
+    if (!this.passcode || !key || !same(key, this.passcode)) return null;
+    return `${COOKIE}=${this.cookieValue}; Path=/; HttpOnly; ${secure ? "Secure; " : ""}SameSite=Lax; Max-Age=${MONTH}`;
+  }
+
+  /**
+   * Who is asking, on a demo with a passcode: the id in their ff_vid cookie, or a new random one with the cookie that
+   * keeps it (`setCookie`, for the caller to send). Without a passcode there is one user and no id (undefined).
+   * The id is 128 random bits that only the visitor's browser holds: the server never shows one visitor another's.
+   */
+  visitor(cookieHeader: string | undefined, secure = true): { id?: string; setCookie?: string } {
+    if (!this.passcode || this.sharedHistory) return {};
+    const got = parseCookies(cookieHeader)[VISITOR];
+    if (got && VISITOR_ID.test(got)) return { id: got };
+    const id = randomBytes(16).toString("hex");
+    return { id, setCookie: `${VISITOR}=${id}; Path=/; HttpOnly; ${secure ? "Secure; " : ""}SameSite=Lax; Max-Age=${MONTH}` };
+  }
+
+  /** Why a new run may not start now, or null when it may. `active` = runs still going. */
+  refuse(active: number): string | null {
+    this.roll();
+    if (this.maxActive && active >= this.maxActive) {
+      return `${active} run(s) are still going on this demo (it allows ${this.maxActive} at a time); try again when one finishes`;
+    }
+    if (this.maxRunsPerDay && this.state.runs >= this.maxRunsPerDay) {
+      return `this demo's ${this.maxRunsPerDay} runs for today (UTC) are used up; it resets at 00:00 UTC`;
+    }
+    return null;
+  }
+
+  /** Count one run that was accepted. */
+  record(): void {
+    this.roll();
+    this.state.runs += 1;
+    this.save();
+  }
+
+  status(active: number) {
+    this.roll();
+    return {
+      runs_today: this.state.runs, max_runs_per_day: this.maxRunsPerDay ?? null, max_active: this.maxActive ?? null,
+      runs_left: this.maxRunsPerDay ? Math.max(0, this.maxRunsPerDay - this.state.runs) : null, active,
+    };
+  }
+
+  private today(): string {
+    return this.now().toISOString().slice(0, 10);
+  }
+
+  private roll(): void {
+    if (this.state.day !== this.today()) this.state = { day: this.today(), runs: 0 };
+  }
+
+  private load(): { day: string; runs: number } {
+    try {
+      if (this.stateFile && existsSync(this.stateFile)) {
+        const s = JSON.parse(readFileSync(this.stateFile, "utf-8"));
+        if (typeof s.day === "string" && Number.isInteger(s.runs)) return { day: s.day, runs: s.runs };
+      }
+    } catch { /* a damaged file starts the count again */ }
+    return { day: this.today(), runs: 0 };
+  }
+
+  private save(): void {
+    if (!this.stateFile) return;
+    mkdirSync(dirname(this.stateFile), { recursive: true });
+    const tmp = `${this.stateFile}.tmp`;
+    writeFileSync(tmp, JSON.stringify(this.state) + "\n");
+    renameSync(tmp, this.stateFile);
+  }
+}
+
+/**
+ * Why a request does not come from this app's own pages, or null when it does.
+ *  - Host: a server listening on loopback answers only to loopback names (and FREEFIELD_ALLOWED_HOSTS), so a site
+ *    whose DNS name is rebound to 127.0.0.1 cannot read or drive it.
+ *  - a request that changes something (anything but GET/HEAD/OPTIONS) must not be cross-site: Sec-Fetch-Site says so
+ *    in current browsers, and an Origin header that is not this host says so in the others. Scripts and the CLI send
+ *    neither header and pass.
+ */
+export function foreign(req: { method?: string; headers: Record<string, string | string[] | undefined> },
+  opts: { loopbackOnly: boolean; allowedHosts?: string[] }): string | null {
+  const one = (v: string | string[] | undefined) => (Array.isArray(v) ? v[0] : v) ?? "";
+  const host = one(req.headers.host).toLowerCase();
+  const hostname = host.startsWith("[") ? host.slice(0, host.indexOf("]") + 1) : host.split(":")[0];
+  if (opts.loopbackOnly && !LOOPBACK.has(hostname) && !(opts.allowedHosts ?? []).includes(hostname)) {
+    return `this server only answers to localhost (Host: ${host || "none"}); add the name to FREEFIELD_ALLOWED_HOSTS to allow it`;
+  }
+  if (["GET", "HEAD", "OPTIONS"].includes((req.method ?? "GET").toUpperCase())) return null;
+  const site = one(req.headers["sec-fetch-site"]).toLowerCase();
+  if (site === "cross-site") return "requests from other sites are refused";
+  if (site === "same-origin") return null;   // the browser vouches for it, even behind a proxy that rewrites Host
+  const origin = one(req.headers.origin);
+  if (origin) {
+    let originHost: string;
+    try { originHost = new URL(origin).host.toLowerCase(); } catch { return "requests from other sites are refused"; }
+    const fwdHost = one(req.headers["x-forwarded-host"]).split(",")[0].trim().toLowerCase();
+    if (originHost !== host && (!fwdHost || originHost !== fwdHost)) return "requests from other sites are refused";
+  }
+  return null;
+}
+
+/**
+ * Did this request come over plain http to a bare IP address, as a Vast.ai port does (http://203.0.113.7:41234)?
+ * Then cookies cannot be Secure. Names (Modal, RunPod's proxy, a tunnel, localhost) keep Secure: Modal and RunPod end
+ * TLS before the container and do not always say so, and browsers accept Secure cookies on http://localhost.
+ */
+export function plainHttpToIp(req: { headers: Record<string, string | string[] | undefined>; socket?: object }): boolean {
+  const one = (v: string | string[] | undefined) => (Array.isArray(v) ? v[0] : v) ?? "";
+  if ((req.socket as { encrypted?: boolean } | undefined)?.encrypted || /https/i.test(one(req.headers["x-forwarded-proto"]))) return false;
+  const host = one(req.headers.host).toLowerCase();
+  const name = host.startsWith("[") ? host.slice(1, host.indexOf("]")) : host.split(":")[0];
+  return isIP(name) !== 0 && !LOOPBACK.has(name);
+}
+
+export function parseCookies(header: string | undefined): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const part of (header ?? "").split(";")) {
+    const i = part.indexOf("=");
+    if (i > 0) out[part.slice(0, i).trim()] = part.slice(i + 1).trim();
+  }
+  return out;
+}
+
+function same(a: string, b: string): boolean {
+  const x = Buffer.from(a);
+  const y = Buffer.from(b);
+  return x.length === y.length && timingSafeEqual(x, y);
+}
+
+/** The page a visitor without the cookie gets: one field for the passcode. */
+export const DOOR_HTML = `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Freefield</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect x='1' y='1' width='30' height='30' rx='9' fill='%23e8ff5a'/%3E%3Cpath d='M8 11.5h16M8 16.5h9M8 21.5h12' stroke='%2311140a' stroke-width='3' stroke-linecap='round'/%3E%3Ccircle cx='22.5' cy='16.5' r='1.9' fill='%2311140a'/%3E%3C/svg%3E">
+<style>
+:root{color-scheme:dark}body{margin:0;min-height:100vh;display:grid;place-items:center;background:#09090a;color:#f4f4f2;font:15px/1.5 system-ui,sans-serif}
+form{display:grid;gap:12px;width:min(320px,calc(100vw - 32px))}h1{margin:0;font-size:22px}p{margin:0;color:#9b9ba3}
+input,button{font:inherit;padding:10px 12px;border-radius:8px;border:1px solid #2e2e33;background:#151517;color:inherit}
+button{background:#e8ff5a;color:#11140a;border:0;font-weight:600;cursor:pointer}</style></head>
+<body><form method="get" action="/"><h1>Freefield</h1><p>This demo is private. Enter the passcode you were given.</p>
+<input name="key" type="password" autocomplete="current-password" aria-label="Passcode" required autofocus><button>Open</button></form></body></html>`;
+
+// Where the owner of a pod or of their own GPU finds the passcode (FREEFIELD_BACKEND_NAME, set by infra/pod.py)
+const WHERE: Record<string, { en: string; es: string }> = {
+  "RunPod": { en: "It is in the pod's log on RunPod (Logs), on the line that starts with Passcode, and in the link above it.",
+    es: "Está en el log del pod en RunPod (Logs), en la línea que empieza con Passcode, y en el link de arriba de esa línea." },
+  "Vast.ai": { en: "It is in the instance's log on Vast.ai, on the line that starts with Passcode, and in the link above it.",
+    es: "Está en el log de la instancia en Vast.ai, en la línea que empieza con Passcode, y en el link de arriba de esa línea." },
+  "this computer": { en: "It is in the window of the Freefield launcher, and in the container's log (docker logs freefield).",
+    es: "Está en la ventana del lanzador de Freefield, y en el log del contenedor (docker logs freefield)." },
+};
+
+/** The door of a pod or of your own GPU: the same form, and where its owner finds the passcode. */
+export function ownerDoor(backend: string, acceptLanguage = ""): string {
+  const where = WHERE[backend];
+  if (!where) return DOOR_HTML;
+  const es = /^es\b/i.test(acceptLanguage.trim());
+  const text = es ? `Este Freefield es privado. Escribe su passcode. ${where.es}` : `This Freefield is private. Enter its passcode. ${where.en}`;
+  return DOOR_HTML.replace("This demo is private. Enter the passcode you were given.", text)
+    .replace('<html lang="en">', `<html lang="${es ? "es" : "en"}">`).replace(">Open</button>", es ? ">Abrir</button>" : ">Open</button>");
+}
