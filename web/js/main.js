@@ -1,19 +1,20 @@
 // Boot and routing. Each route builds a view ({ node, dispose, active }) into <main>.
 //   #/                 Explore         #/apps      the app store       #/app/<id>  an app's workspace
 //   #/image #/video #/audio            the studios (open the last app used there)
-//   #/library          history and lab examples                       #/vram      the VRAM map
-import { el, closePopover, toast, api } from "./util.js";
+//   #/library          history & examples                               #/account    user profile, credits & projects
+//   #/admin            RBAC-protected Admin Control Centre (admin accounts & first-run bootstrap)
+import { el, closePopover, toast, session } from "./util.js";
 import { t } from "./i18n.js";
-import { loadCatalog, byId, lastAppFor, studioOf, FEATURED, hosted, modelsPanel } from "./catalog.js";
-import { topbar, gpuState, pollGpu } from "./nav.js";
-import { exploreView, appsView, libraryView, vramView } from "./views.js";
+import { loadCatalog, byId, lastAppFor, studioOf, FEATURED } from "./catalog.js";
+import { topbar } from "./nav.js";
+import { exploreView, appsView, libraryView } from "./views.js";
 import { workspaceView, recreate, useIn } from "./workspace.js";
-import { hooks, feed } from "./feed.js";
+import { accountView, announcementStrip, refreshBootstrap } from "./account.js";
+import { adminView } from "./admin.js";
+import { hooks } from "./feed.js";
 import { openViewer } from "./viewer.js";
 import { openCompare } from "./compare.js";
 import { flags } from "./flags.js";
-import { modelsStrip, startModels, redrawModels } from "./models.js";
-import { desktopIconCard } from "./desktop.js";
 
 const main = el("main", { id: "main", class: "view" });
 let bar = null;
@@ -35,7 +36,8 @@ function route() {
   }
   if (hash.startsWith("#/apps")) return appsView();
   if (hash.startsWith("#/library")) return libraryView();
-  if (hash.startsWith("#/vram")) return vramView(gpuState.data?.device ? gpuState.data : null);
+  if (hash.startsWith("#/account")) return accountView();
+  if (hash.startsWith("#/admin")) return adminView();
   return exploreView();
 }
 
@@ -49,17 +51,21 @@ function render({ keepScroll = false } = {}) {
   bar?.update(view.active);
   if (!keepScroll) window.scrollTo(0, 0);
   const app = view.app;
-  document.title = app ? `${app.name} · SPACIX` : "SPACIX";
+  const brand = session.bootstrap?.platform_name || "SPACIX";
+  document.title = app ? `${app.name} · ${brand}` : view.active === "admin" ? `Admin · ${brand}` : brand;
 }
 
-const strip = modelsStrip();   // under the top bar: a download on its way, apps waiting for a license
+const strip = announcementStrip();
 function buildBar() {
-  const next = topbar({ onLang: () => { buildBar(); redrawModels(); render({ keepScroll: true }); } });
-  if (bar) bar.node.replaceWith(next.node); else document.body.prepend(next.node);
+  const next = topbar({ onLang: () => { buildBar(); render({ keepScroll: true }); } });
+  if (bar) {
+    bar.dispose?.();
+    bar.node.replaceWith(next.node);
+  } else {
+    document.body.prepend(next.node);
+  }
   bar = next;
   bar.node.after(strip);
-  gpuState.listeners.add(desktopIconCard);   // the bar clears the listeners when it is rebuilt (a new language)
-  desktopIconCard(gpuState.data);
 }
 
 hooks.open = (items, key) => openViewer(items, key);
@@ -69,16 +75,10 @@ hooks.compare = (item) => openCompare(item);
 hooks.useIn = (anchor, item, done) => useIn(anchor, item, done);
 hooks.rerender = () => render({ keepScroll: true });
 
-// a run starting or ending changes what the GPU pill should say
-let activeRuns = 0;
-feed.on(() => {
-  const n = feed.active().length;
-  if (n !== activeRuns) { activeRuns = n; pollGpu(); }
-});
-
 async function boot() {
   document.body.append(main);
   try {
+    await refreshBootstrap();
     await loadCatalog();
     await flags.load();
   } catch (err) {
@@ -88,22 +88,6 @@ async function boot() {
   buildBar();
   window.addEventListener("hashchange", () => render());
   render();
-  if (modelsPanel) startModels();
-  if (hosted) wakeOnce();
-}
-
-// on the hosted demo the GPU starts when someone opens the page, so it is warm by the time they press Generate
-async function wakeOnce() {
-  try { if (sessionStorage.getItem("ff.woke") === "1") return; } catch { /* no storage: wake every visit */ }
-  try {
-    const g = await api("/api/gpu");
-    if (g.configured && !g.warm && !g.waking) {
-      await api("/api/gpu/wake", { method: "POST" });
-      toast(t("gpu.autowake"));
-      pollGpu();
-    }
-    try { sessionStorage.setItem("ff.woke", "1"); } catch { /* fine */ }
-  } catch { /* the pill still offers the button */ }
 }
 
 window.addEventListener("unhandledrejection", (e) => {

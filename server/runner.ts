@@ -1,18 +1,18 @@
-// The waiter: turns form values into a filled workflow using only what app.json says,
-// asks the gateway to clear the GPU when the app's models change, and submits with the Comfy SDK.
-import { Comfy } from "@comfyorg/sdk";
+// Provider-independent parameter resolution, template composition, and SSE parsing.
+// Turns form values + app.json manifests into validated values and compiled parameters
+// without requiring ComfyUI or any local runtime.
 import type { App, Input } from "./registry.ts";
-import { isFileInput, modelKey } from "./registry.ts";
+import { isFileInput } from "./registry.ts";
 
 export type FileValue = { bytes: Uint8Array; name: string; type?: string };
 export type Values = Record<string, unknown>;
 
-/** Anything with setInput, so tests can pass a fake instead of the SDK's Workflow. */
+/** Collector target passed to applyInputs() to capture bound fields from app.json. */
 export type Settable = { setInput(node: string, field: string, value: unknown): unknown };
 
 export class InputError extends Error {}
 
-function isFileValue(v: unknown): v is FileValue {
+export function isFileValue(v: unknown): v is FileValue {
   return typeof v === "object" && v !== null && (v as FileValue).bytes instanceof Uint8Array;
 }
 
@@ -69,10 +69,12 @@ export function joinPicks(input: Input, list: unknown): string {
   return `${m.prefix ?? ""}${items.join(m.join ?? ", ")}${m.suffix ?? ""}`;
 }
 
-/** Values as the workflow gets them: multiple selects joined. */
+/** Values as templates receive them: multiple selects joined. */
 export function textValues(app: App, values: Values): Values {
   const out: Values = { ...values };
-  for (const input of app.inputs) if (input.multiple && values[input.id] !== undefined) out[input.id] = joinPicks(input, values[input.id]);
+  for (const input of app.inputs) {
+    if (input.multiple && values[input.id] !== undefined) out[input.id] = joinPicks(input, values[input.id]);
+  }
   return out;
 }
 
@@ -81,7 +83,6 @@ export function resolveValues(app: App, values: Values): Values {
   const out: Values = {};
   for (const input of app.inputs) {
     let v = values[input.id];
-    // "" is a choice when a select offers it ("Any" in a builder writes nothing); elsewhere it means "use the default"
     const emptyIsOption = input.type === "select" && (Boolean(input.multiple) || (input.options ?? []).some((o) => o.value === ""));
     if (v === undefined || (v === "" && !emptyIsOption)) v = input.default;
     if (input.type === "seed" && (v === undefined || v === -1 || v === "-1")) {
@@ -119,14 +120,14 @@ export function setValue(value: unknown, values: Values): unknown {
 }
 
 /**
- * Apply resolved values and an optional preset to a workflow.
- * `asset` turns a FileValue into whatever the workflow expects (an SDK asset handle).
+ * Apply resolved values and an optional preset onto a target Settable collector.
+ * Preserves 100% compatibility with app.json bindings, templates, options.sets, and presets.
  */
 export function applyInputs(
   app: App,
   values: Values,
-  wf: Settable,
-  asset: (f: FileValue) => unknown,
+  target: Settable,
+  asset: (f: FileValue, inputId: string) => unknown,
   presetId?: string,
 ): void {
   values = textValues(app, values);
@@ -134,158 +135,22 @@ export function applyInputs(
     const v = values[input.id];
     if (v === undefined) continue;
     for (const b of input.bind ?? []) {
-      if (b.template) wf.setInput(b.node, b.field, renderTemplate(b.template, values));
-      else wf.setInput(b.node, b.field, isFileValue(v) ? asset(v) : v);
+      if (b.template) target.setInput(b.node, b.field, renderTemplate(b.template, values));
+      else target.setInput(b.node, b.field, isFileValue(v) ? asset(v, input.id) : v);
     }
-    // a select option can carry extra fields (the LoRA that goes with a style, an effect's prompt)
     const chosen = input.type === "select" ? input.options?.find((o) => o.value === v) : undefined;
-    for (const s of chosen?.sets ?? []) wf.setInput(s.node, s.field, setValue(s.value, values));
+    for (const s of chosen?.sets ?? []) target.setInput(s.node, s.field, setValue(s.value, values));
   }
   if (presetId) {
     const preset = (app.presets ?? []).find((p) => p.id === presetId);
     if (!preset) throw new InputError(`preset "${presetId}" does not exist in ${app.id}`);
-    for (const s of preset.sets) wf.setInput(s.node, s.field, setValue(s.value, values));
-  }
-}
-
-type NodeError = { type?: string; message?: string; details?: string; extra_info?: { input_name?: string; received_value?: unknown } };
-type NodeErrors = Record<string, { class_type?: string; errors?: NodeError[] } | NodeError[]>;
-
-/**
- * Turn ComfyUI's validation errors (relayed by the proxy as details.node_errors) into lines a
- * person can act on. When a loader asks for a model file the backend does not have, say which
- * pack to download. Returns null for errors that are not workflow validation errors.
- */
-export function explainSubmitError(app: App, e: unknown): string | null {
-  const err = e as { code?: string; details?: { node_errors?: NodeErrors } | null; message?: string };
-  if (err?.code !== "invalid_workflow") return null;
-  const modelFiles = new Set(app.models.map((m) => m.file.split("/").pop()));
-  const lines: string[] = [];
-  let missingModel = false;
-  for (const [node, entry] of Object.entries(err.details?.node_errors ?? {})) {
-    const errors = Array.isArray(entry) ? entry : entry.errors ?? [];
-    const cls = Array.isArray(entry) ? "" : entry.class_type ?? "";
-    for (const x of errors) {
-      const received = x.extra_info?.received_value ?? /'([^']+)' not in/.exec(x.details ?? "")?.[1];
-      if (x.type === "value_not_in_list" && typeof received === "string" && modelFiles.has(received)) {
-        missingModel = true;
-        lines.push(`${cls || "node"} (node ${node}): model file ${received} is not on the backend`);
-      } else {
-        const detail = (x.details ?? "").replace(/ not in \[.*$/s, " is not one of the allowed values");
-        lines.push(`${cls || "node"} (node ${node}): ${x.message ?? x.type ?? "invalid"}${detail ? ` (${detail.slice(0, 200)})` : ""}`);
-      }
-    }
-  }
-  if (!lines.length) lines.push(err.message ?? "workflow rejected");
-  if (missingModel) {
-    lines.push(`Download the "${app.pack}" pack first:  modal run infra/modal_app.py::download --pack ${app.pack}`);
-  }
-  return `ComfyUI rejected the workflow:\n${lines.map((l) => `  ${l}`).join("\n")}`;
-}
-
-export type RunnerOptions = {
-  /** Gateway in front of comfy-api-proxy, e.g. https://you--freefield-serve.modal.run */
-  baseUrl?: string;
-  /** Token the gateway expects; sent by the SDK as a bearer token. */
-  token?: string;
-  /** Let draft apps run too (default: FREEFIELD_DRAFTS=1). Drafts have a workflow nobody has run on a GPU yet. */
-  allowDrafts?: boolean;
-  fetch?: typeof fetch;
-};
-
-export class Runner {
-  readonly baseUrl: string;
-  readonly token?: string;
-  readonly allowDrafts: boolean;
-  private comfy: Comfy;
-  private doFetch: typeof fetch;
-
-  constructor(opts: RunnerOptions = {}) {
-    this.baseUrl = (opts.baseUrl ?? process.env.COMFY_BASE_URL ?? "").replace(/\/$/, "");
-    if (!this.baseUrl) throw new Error("Set COMFY_BASE_URL to the gateway URL");
-    this.token = opts.token ?? process.env.FREEFIELD_TOKEN ?? undefined;
-    this.allowDrafts = opts.allowDrafts ?? process.env.FREEFIELD_DRAFTS === "1";
-    process.env.COMFY_BASE_URL = this.baseUrl; // the SDK reads its base URL from the environment
-    this.doFetch = opts.fetch ?? fetch;
-    this.comfy = new Comfy({ apiKey: this.token, clientInfo: "freefield", fetch: opts.fetch });
-  }
-
-  /**
-   * Ask the gateway to make room for this app. It compares the model set with the one
-   * loaded last and unloads everything from VRAM when they differ. A backend without the
-   * Freefield gateway (a bare comfy-api-proxy, a hosted Comfy API) answers 404 and manages
-   * its own memory, so that is not an error.
-   */
-  async prepare(app: App): Promise<{ freed: boolean; skipped?: boolean }> {
-    const res = await this.doFetch(`${this.baseUrl}/freefield/prepare`, {
-      method: "POST",
-      headers: {
-        "content-type": "application/json",
-        ...(this.token ? { authorization: `Bearer ${this.token}` } : {}),
-      },
-      body: JSON.stringify({ app: app.id, models: modelKey(app) }),
-    });
-    if (res.status === 404 || res.status === 405) return { freed: false, skipped: true };
-    if (!res.ok) throw new Error(`gateway /freefield/prepare answered ${res.status}`);
-    return (await res.json()) as { freed: boolean };
-  }
-
-  async submit(app: App, rawValues: Values, presetId?: string) {
-    if (!app.workflowPath) throw new InputError(`${app.id} has no workflow yet`);
-    if (app.status !== "ready" && !this.allowDrafts) {
-      throw new InputError(`${app.id} is a draft; set FREEFIELD_DRAFTS=1 (or pass --draft) to run it anyway`);
-    }
-    const values = resolveValues(app, rawValues);
-    await this.prepare(app);
-    const wf = await this.comfy.workflows.fromFile(app.workflowPath);
-    applyInputs(
-      app,
-      values,
-      wf,
-      (f) => this.comfy.assets.fromBytes(f.bytes, { filename: f.name, contentType: f.type || undefined }),
-      presetId,
-    );
-    return this.comfy.submit(wf);
-  }
-
-  jobs() {
-    return this.comfy.jobs;
-  }
-
-  /**
-   * The job's event stream (GET /api/v2/jobs/{id}/events) read as it comes, frame by frame, without the SDK's
-   * job.events(): that one drops any progress frame lower than the last, and comfy-api-proxy's first frames
-   * can say 1.0 (history.ts, Meter). Reconnects while the signal is alive; a stream that answers anything
-   * but 200 (the job is gone) ends quietly: the poll decides.
-   */
-  async *frames(jobId: string, signal: AbortSignal): AsyncIterable<Frame> {
-    const url = `${this.baseUrl}/api/v2/jobs/${encodeURIComponent(jobId)}/events`;
-    const headers = { accept: "text/event-stream", ...(this.token ? { authorization: `Bearer ${this.token}` } : {}) };
-    let failures = 0;
-    while (!signal.aborted) {
-      let res: Response;
-      try {
-        res = await this.doFetch(url, { headers, signal });
-      } catch {
-        if (signal.aborted || ++failures > 20) return;
-        await new Promise((r) => setTimeout(r, Math.min(10_000, 1000 * failures)));
-        continue;
-      }
-      if (res.status !== 200 || !res.body) return;
-      failures = 0;
-      try {
-        yield* parseSse(res.body);
-      } catch {
-        if (signal.aborted) return;
-      }
-      if (!signal.aborted) await new Promise((r) => setTimeout(r, 1000));
-    }
+    for (const s of preset.sets) target.setInput(s.node, s.field, setValue(s.value, values));
   }
 }
 
 export type Frame = { event: string; data: Record<string, unknown> };
 
-/** Server-sent events, as the spec reads them: `event:` and `data:` lines, a blank line ends a frame. */
+/** Server-sent events reader. */
 export async function* parseSse(body: ReadableStream<Uint8Array>): AsyncIterable<Frame> {
   const reader = body.getReader();
   const decoder = new TextDecoder();

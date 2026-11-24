@@ -52,7 +52,7 @@ export function openCompare(item) {
   const setRightFile = (file) => {
     const url = URL.createObjectURL(file);
     urls.push(url);
-    right = { label: store.lastLabel || "Higgsfield", type: kindOfFile(file), url, size: file.size, name: file.name };
+    right = { label: store.lastLabel || t("cmp.ref"), type: kindOfFile(file), url, size: file.size, name: file.name };
     draw();
   };
   const store = { lastLabel: null };

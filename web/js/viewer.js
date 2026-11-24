@@ -53,10 +53,9 @@ export function openViewer(items, key) {
     stage.replaceChildren(...stageKids);
 
     const stats = [];
-    if (item.seconds) stats.push(el("span", {}, t("view.gpu", { s: fmtSeconds(item.seconds) })));
+    if (item.seconds) stats.push(el("span", {}, t("view.time", { s: fmtSeconds(item.seconds) })));
     if (item.total && item.total !== item.seconds) stats.push(el("span", {}, t("view.total", { s: fmtSeconds(item.total) })));
     if (item.seed !== null && item.seed !== undefined) stats.push(el("span", {}, t("view.seed", { n: item.seed })));
-    if (item.peak) stats.push(el("span", {}, t("view.peak", { gb: item.peak })));
 
     const acts = [
       app ? el("button", {

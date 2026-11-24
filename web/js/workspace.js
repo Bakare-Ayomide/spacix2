@@ -1,15 +1,16 @@
 // App workspace view: builds forms from app.json, handles uploads/painting/presets, submits runs, and shows history/how-it-works.
-import { el, icon, popover, closePopover, toast, clamp, fmtSeconds } from "./util.js";
+import { el, icon, popover, closePopover, toast, clamp, fmtSeconds, session } from "./util.js";
 import { t } from "./i18n.js";
 import {
   apps, byId, layoutOf, familyOf, VIDEO_TABS, videoTabOf,
-  tagline, estimate, fitOf, iconOf, promptInput, draftsAllowed,
+  tagline, estimate, iconOf, promptInput, draftsAllowed,
 } from "./catalog.js";
 import { exampleItem, thumb, hoverPlay, optionTile } from "./media.js";
 import { feed, feedView } from "./feed.js";
 import { openPainter, maskPreview } from "./paint.js";
-import { needNode, models } from "./models.js";
+import { needNode } from "./models.js";
 import { flagButton, flags } from "./flags.js";
+import { openAuthModal, refreshBootstrap } from "./account.js";
 
 const FILE_TYPES = new Set(["image", "video", "audio"]);
 const isFile = (inp) => FILE_TYPES.has(inp.type);
@@ -107,6 +108,7 @@ export function workspaceView(appId) {
   const files = {};
   const previews = new Map();
   let presetId = null;
+  let selectedModelId = app.available_models?.[0]?.id || null;
   let activeTab = "history";
   let dense = false;
   let submitting = false;
@@ -480,8 +482,13 @@ export function workspaceView(appId) {
   }
 
   function canRun() {
-    if (!app.workflowPath) return { ok: false, reason: el("span", {}, t("ws.noworkflow")) };
-    if (app.status === "draft" && !draftsAllowed) return { ok: false, reason: el("span", {}, t("ws.draft")) };
+    if (session.bootstrap?.maintenance_mode && !session.user?.is_admin) {
+      return { ok: false, reason: needNode(app) };
+    }
+    if (app.availability && !app.availability.supported) return { ok: false, reason: needNode(app) };
+    if (app.status === "draft" && !draftsAllowed && !session.user?.is_admin) {
+      return { ok: false, reason: el("span", {}, t("ws.draft")) };
+    }
     const need = needNode(app);
     if (need) return { ok: false, reason: need };
     return { ok: true, reason: null };
@@ -521,15 +528,20 @@ export function workspaceView(appId) {
           }
         }
         if (presetId) fd.append("preset", presetId);
+        if (selectedModelId) fd.append("model_id", selectedModelId);
         const entry = await feed.run(app.id, fd);
         if (entry.values?.seed != null) lastSeed = entry.values.seed;
       }
+      refreshBootstrap().catch(() => {});
       toast(t("toast.started", { app: app.name }));
       if (activeTab !== "history") {
         activeTab = "history";
         drawMain();
       }
     } catch (err) {
+      if (err.status === 401) {
+        openAuthModal("login");
+      }
       toast(err.message, { error: true });
     } finally {
       submitting = false;
@@ -549,18 +561,24 @@ export function workspaceView(appId) {
       }).filter(Boolean));
   }
 
+  let syncRunUi = null;
+
   function generateButton({ wide = false } = {}) {
     const est = estimate(app);
     const runStatus = canRun();
+    const billingOn = session.bootstrap?.credit_billing_enabled !== false;
+    const costCredits = billingOn && Number(app.credit_cost) > 0 ? `${app.credit_cost} ${t("acc.cr")}` : null;
+    const costLabel = [costCredits, est ? fmtSeconds(est.seconds) : null].filter(Boolean).join(" · ");
     const btn = el("button", {
       class: `generate${wide ? " wide" : ""}`, type: "button",
       disabled: !runStatus.ok,
-      title: est ? t("ws.est", { gpu: est.gpu }) : null,
+      title: est ? t("ws.est", { s: fmtSeconds(est.seconds) }) : null,
       onclick: submitRun,
     },
     icon("spark"),
     t("ws.generate"),
-    est ? el("span", { class: "cost" }, fmtSeconds(est.seconds)) : null);
+    costLabel ? el("span", { class: "cost" }, costLabel) : null);
+    btn._syncRun = (ok) => { btn.disabled = !ok; };
     return btn;
   }
 
@@ -675,6 +693,25 @@ export function workspaceView(appId) {
       chips.push(cBtn);
     }
 
+    if (app.available_models?.length > 1) {
+      const mVal = el("span", { class: "v" });
+      const mBtn = el("button", {
+        class: "chip", type: "button",
+        onclick: () => popover(mBtn, el("div", {},
+          el("h4", {}, t("how.primary_model")),
+          ...app.available_models.map((m) => el("button", {
+            class: "opt", type: "button", "aria-selected": String(selectedModelId === m.id),
+            onclick: () => { selectedModelId = m.id; closePopover(); syncModel(); },
+          }, m.name, el("span", { class: "chk" }, icon("check")))))),
+      }, el("span", { class: "k" }, t("ws.model")), mVal, icon("chev"));
+      const syncModel = () => {
+        const cur = app.available_models.find((m) => m.id === selectedModelId) || app.available_models[0];
+        mVal.textContent = cur ? cur.name : "Default";
+      };
+      syncModel();
+      chips.push(mBtn);
+    }
+
     const extraAdv = [...primarySelects.slice(4), ...advInputs];
     if (extraAdv.length) {
       const advBtn = el("button", {
@@ -687,11 +724,18 @@ export function workspaceView(appId) {
     }
 
     const runStatus = canRun();
-    const hint = runStatus.reason ? el("div", { class: "cmp-hint err" }, runStatus.reason) : null;
+    const genBtn = generateButton();
+    const hint = el("div", { class: "cmp-hint err", hidden: !runStatus.reason }, runStatus.reason);
+    syncRunUi = () => {
+      const next = canRun();
+      genBtn._syncRun(next.ok);
+      hint.hidden = !next.reason;
+      hint.replaceChildren(...(next.reason ? [next.reason] : []));
+    };
 
     const composer = el("div", { class: "composer" },
       el("div", { class: "cmp-top" }, attachRow, ta),
-      el("div", { class: "cmp-row" }, ...chips.filter(Boolean), el("span", { class: "grow" }), countControl(), generateButton()),
+      el("div", { class: "cmp-row" }, ...chips.filter(Boolean), el("span", { class: "grow" }), countControl(), genBtn),
       hint);
 
     composer.addEventListener("dragover", (e) => { e.preventDefault(); composer.classList.add("drag"); });
@@ -752,23 +796,43 @@ export function workspaceView(appId) {
       return el("div", { class: "field" }, el("div", { class: "lbl" }, t("ws.preset")), seg);
     })() : null;
 
+    const modelPickerField = app.available_models?.length > 1 ? (() => {
+      const sel = el("select", {
+        style: {
+          width: "100%", height: "38px", padding: "0 10px", borderRadius: "10px",
+          background: "#0f0f11", border: "1px solid #2a2a2f", color: "var(--ink)", font: "inherit",
+        },
+        onchange: () => { selectedModelId = sel.value; },
+      }, ...app.available_models.map((m) => el("option", { value: m.id, selected: m.id === selectedModelId }, m.name)));
+      return el("div", { class: "field" }, el("div", { class: "lbl" }, t("ws.model")), sel);
+    })() : null;
+
     const advDetails = advanced.length ? el("details", { class: "adv" },
       el("summary", {}, t("ws.advanced"), icon("chev")),
       el("div", { class: "in" }, ...advanced.map((i) => renderFieldControl(i)))) : null;
 
     const runStatus = canRun();
+    const genBtn = generateButton({ wide: true });
+    const noteEl = el("p", { class: "side-note err", hidden: !runStatus.reason }, runStatus.reason);
+    syncRunUi = () => {
+      const next = canRun();
+      genBtn._syncRun(next.ok);
+      noteEl.hidden = !next.reason;
+      noteEl.replaceChildren(...(next.reason ? [next.reason] : []));
+    };
 
     return el("aside", { class: "side" },
       sideTabs,
       el("div", { class: "side-scroll" },
         modelCard,
         modesSwitch(),
+        modelPickerField,
         ...primary.map((i) => renderFieldControl(i)),
         presetField,
         advDetails),
       el("div", { class: "side-foot" },
-        el("div", { class: "row" }, countControl(), generateButton({ wide: true })),
-        runStatus.reason ? el("p", { class: "side-note err" }, runStatus.reason) : null));
+        el("div", { class: "row" }, countControl(), genBtn),
+        noteEl));
   }
 
   // ------------------------------------------------------------------ Main area (History / Lab Example / How it works)
@@ -849,42 +913,49 @@ export function workspaceView(appId) {
   }
 
   function renderHowTab() {
-    const totalGb = app.models.reduce((acc, m) => acc + (m.optional ? 0 : m.gb || 0), 0);
-    const fit = fitOf(app);
+    const a = app.availability || {};
+    const filteredCredits = (app.credits || []).filter((c) => !/comfy|higgsfield|kijai/i.test(String(c)));
+    const statusLabel = !a.supported
+      ? t("tag.unsupported")
+      : a.available
+        ? t("status.ready")
+        : t("tag.unavailable");
+
     return el("div", { class: "how-grid" },
       el("div", { class: "card" },
         el("h3", {}, icon("layers"), t("how.pipeline")),
-        el("p", {}, t("how.pipeline.d", { id: app.id })),
-        app.higgsfield_feature ? el("p", {}, el("b", {}, `${t("how.equiv")}: `), app.higgsfield_feature) : null,
-        app.workflowPath !== null ? el("div", {},
-          el("a", { class: "btn small", href: `/api/apps/${app.id}/workflow`, download: `spacix-${app.id}.json` },
-            icon("download"), t("how.workflow")),
-          el("p", { style: { marginTop: "8px" } }, t("how.workflow.d"))) : null),
-
-      el("div", { class: "card" },
-        el("h3", {}, icon("download"), t("how.models")),
-        el("p", {}, `${t("how.pack")}: `, el("b", {}, app.pack), totalGb > 0 ? ` · ${t("how.total", { gb: totalGb.toFixed(1) })}` : ""),
-        el("table", { class: "models" }, ...app.models.map((m) => el("tr", {},
-          el("td", {},
-            el("div", {}, m.name),
-            el("small", { class: "dim" }, m.repo, m.gated ? ` · ${t("how.gated")}` : "", m.optional ? ` · ${t("how.optional")}` : "")),
-          el("td", { class: "r" }, `${m.gb} ${t("unit.gb")}`))))),
-
-      app.vram ? el("div", { class: "card" },
-        el("h3", {}, icon("chip"), t("how.vram")),
-        fit ? el("span", { class: `fit ${fit[1]}` }, t(fit[0])) : null,
+        el("p", {}, t("how.pipeline.d", { name: app.name })),
         el("dl", { class: "vals" },
-          el("dt", {}, t("how.whole")), el("dd", {}, `${app.vram.whole_gb} ${t("unit.gb")}`),
-          el("dt", {}, t("how.phase")), el("dd", {}, `${app.vram.largest_phase_gb} ${t("unit.gb")}`),
-          app.vram.measured_gb ? el("dt", {}, t("how.measured")) : null,
-          app.vram.measured_gb ? el("dd", {}, `${app.vram.measured_gb} ${t("unit.gb")}`) : null)) : null,
+          el("dt", {}, t("how.capability")), el("dd", {}, a.capability || app.section),
+          el("dt", {}, t("how.primary_model")), el("dd", {}, a.modelName || app.name),
+          el("dt", {}, t("how.credit_cost")), el("dd", {}, `${app.credit_cost ?? 1} ${t("acc.cr")}`),
+          el("dt", {}, t("how.status")), el("dd", {}, statusLabel)),
+        a.reason ? el("p", {}, a.reason) : null),
 
       el("div", { class: "card" },
-        el("h3", {}, icon("code"), t("how.cli")),
-        el("pre", { class: "code" }, `npm run app -- ${app.id}`),
-        app.credits?.length ? el("div", {},
+        el("h3", {}, icon("chip"), t("how.models")),
+        app.available_models?.length
+          ? el("table", { class: "models" }, ...app.available_models.map((m) => el("tr", {},
+            el("td", {}, el("div", {}, m.name)),
+            el("td", { class: "r" }, `${m.credit_price} ${t("acc.cr")}`))))
+          : app.models?.length
+            ? el("table", { class: "models" }, ...app.models.map((m) => el("tr", {},
+              el("td", {},
+                el("div", {}, m.name),
+                m.license || m.optional
+                  ? el("small", { class: "dim" }, [m.license, m.optional ? t("how.optional") : null].filter(Boolean).join(" · "))
+                  : null),
+              el("td", { class: "r" }, m.phase || ""))))
+            : el("p", {}, t("fit.none"))),
+
+      el("div", { class: "card" },
+        el("h3", {}, icon("sliders"), t("how.settings")),
+        el("dl", { class: "vals" },
+          el("dt", {}, t("how.inputs")), el("dd", {}, String(app.inputs.length)),
+          el("dt", {}, t("ws.preset")), el("dd", {}, String(app.presets?.length ?? 0))),
+        filteredCredits.length ? el("div", {},
           el("h3", { style: { marginTop: "6px" } }, t("how.credits")),
-          ...app.credits.map((c) => el("p", {}, c))) : null,
+          ...filteredCredits.map((c) => el("p", {}, c))) : null,
         app.notes ? el("p", {}, el("b", {}, `${t("how.notes")}: `), app.notes) : null));
   }
 
@@ -912,7 +983,7 @@ export function workspaceView(appId) {
     const content = el("div", { style: { flex: 1, display: "flex", flexDirection: "column" } });
 
     if (activeTab === "history") {
-      stopFeed = feedView(content, { app: app.id, empty: emptyHistoryState(), dense });
+      stopFeed = feedView(content, { app: app.id, empty: () => emptyHistoryState(), dense });
     } else if (activeTab === "lab") {
       content.replaceChildren(renderLabTab());
     } else {
@@ -925,13 +996,12 @@ export function workspaceView(appId) {
   drawMain();
   cleanups.push(() => stopFeed?.());
 
-  // Re-evaluate needs if models status updates
-  const offModels = models.listeners ? (() => {
-    const fn = () => {};
-    models.listeners.add(fn);
-    return () => models.listeners.delete(fn);
-  })() : null;
-  if (offModels) cleanups.push(offModels);
+  const onSessionChange = () => {
+    syncRunUi?.();
+    if (activeTab === "how") drawMain();
+  };
+  session.listeners.add(onSessionChange);
+  cleanups.push(() => session.listeners.delete(onSessionChange));
 
   // Hydrate any pending files (recreate / useIn / example)
   if (loadJob?.inputs?.length) {

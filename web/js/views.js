@@ -1,9 +1,9 @@
-// Top-level pages: Explore, Apps store, Library, and VRAM map.
-import { el, icon, masonry, fmtSeconds } from "./util.js";
+// Top-level studio pages: Explore, Apps store, and Library.
+import { el, icon, masonry } from "./util.js";
 import { t } from "./i18n.js";
 import {
   apps, byId, CATEGORIES, START_HERE, HERO, hosted,
-  tagline, estimate, fitOf, iconOf, categoryOf,
+  tagline, estimate, iconOf, categoryOf,
 } from "./catalog.js";
 import { exampleItem, thumb, hoverPlay, optionTile } from "./media.js";
 import { feedView } from "./feed.js";
@@ -17,7 +17,6 @@ function exampleItemsList() {
 }
 
 function gallerySpotlight() {
-  // Showcase apps that have per-option lab examples (e.g. effects, morph, mixed-media)
   const items = [];
   for (const app of apps) {
     const optMap = app.example?.options;
@@ -89,7 +88,7 @@ export function exploreView() {
       },
       media,
       el("span", { class: "nm" }, app.name),
-      el("span", { class: "dim" }, est ? t("start.secs", { s: est.seconds, gpu: est.gpu }) : tagline(app)));
+      el("span", { class: "dim" }, est ? t("start.secs", { s: est.seconds }) : tagline(app)));
       hoverPlay(card, media._video);
       return card;
     }).filter(Boolean))) : null;
@@ -100,7 +99,7 @@ export function exploreView() {
     ["#/audio", "audio", t("tile.audio.t"), t("tile.audio.d")],
     ["#/apps", "layers", t("tile.apps.t"), t("tile.apps.d")],
     ["#/library", "film", t("tile.library.t"), t("tile.library.d")],
-    ["#/vram", "chip", t("tile.vram.t"), t("tile.vram.d")],
+    ["#/account", "user", t("tile.account.t"), t("tile.account.d")],
   ];
 
   const promo = el("section", { class: "promo" },
@@ -138,7 +137,7 @@ export function exploreView() {
     masonry(masonryHost, cards, { min: 240, gap: 12 });
     cleanups.push(() => masonryHost._ro?.disconnect());
   } else {
-    masonryHost.append(el("div", { class: "empty" }, t("explore.noex"), " ", el("code", {}, "python lab/publish.py")));
+    masonryHost.append(el("div", { class: "empty" }, t("explore.noex")));
   }
 
   const madeSection = el("section", {},
@@ -216,7 +215,7 @@ export function appsView() {
   function drawGrid() {
     const matches = (a) => {
       if (!query) return true;
-      const hay = `${a.id} ${a.name} ${a.summary} ${a.higgsfield_feature ?? ""} ${tagline(a)}`.toLowerCase();
+      const hay = `${a.id} ${a.name} ${a.summary} ${a.availability?.modelName ?? ""} ${tagline(a)}`.toLowerCase();
       return hay.includes(query);
     };
 
@@ -306,7 +305,7 @@ export function libraryView() {
     if (tab === "mine") {
       stopFeed = feedView(host, {
         app: filterApp || null,
-        empty: el("div", { class: "empty" }, t("lib.empty")),
+        empty: () => el("div", { class: "empty" }, t("lib.empty")),
       });
       return;
     }
@@ -372,48 +371,4 @@ export function libraryView() {
     active: "library",
     dispose: () => { stopFeed?.(); offFlags?.(); host._ro?.disconnect(); },
   };
-}
-
-export function vramView(gpuData) {
-  const rows = apps.filter((a) => a.vram).sort((a, b) => (b.vram.largest_phase_gb ?? 0) - (a.vram.largest_phase_gb ?? 0));
-  const maxGb = Math.max(48, ...rows.map((a) => Math.max(a.vram.whole_gb || 0, a.vram.measured_gb || 0, a.vram.largest_phase_gb || 0)));
-  const pct = (gb) => `${Math.min(100, ((gb || 0) / maxGb) * 100).toFixed(2)}%`;
-
-  const scaleMarks = [0, 12, 24, 36, 48].filter((v) => v <= maxGb);
-
-  const liveBanner = gpuData?.device?.vram_total_gb
-    ? el("p", { class: "mcallout", style: { background: "var(--panel)", border: "1px solid var(--line-2)", marginBottom: "14px" } },
-      icon("chip"),
-      t("vram.live", { name: gpuData.device.name || "GPU", used: gpuData.device.vram_used_gb ?? 0, total: gpuData.device.vram_total_gb }))
-    : null;
-
-  const page = el("div", { class: "page" },
-    el("div", { class: "sec-head", style: { marginTop: "8px" } },
-      el("div", {},
-        el("h1", { class: "display", style: { margin: 0, fontSize: "clamp(28px, 3.6vw, 44px)" } }, t("vram.title")),
-        el("p", {}, t("vram.sub")))),
-    liveBanner,
-    el("div", { class: "legend", style: { marginBottom: "16px" } },
-      el("span", {}, el("i", { style: { background: "rgba(255, 255, 255, .16)" } }), t("vram.whole")),
-      el("span", {}, el("i", { style: { background: "var(--accent)" } }), t("vram.phase")),
-      el("span", {}, el("i", { style: { background: "var(--pink)" } }), t("vram.measured"))),
-    el("div", { class: "vrow", style: { background: "transparent", border: 0, cursor: "default", padding: "0 12px" } },
-      el("div"),
-      el("div", { class: "vscale" }, ...scaleMarks.map((v) => el("span", { style: { left: pct(v) } }, `${v} ${t("unit.gb")}`))),
-      el("div")),
-    el("div", { class: "vtable" }, ...rows.map((a) => {
-      const fit = fitOf(a);
-      return el("a", { class: "vrow", href: `#/app/${a.id}` },
-        el("div", { class: "nm" },
-          el("b", {}, a.name),
-          el("small", {}, `${a.vram.largest_phase_gb} / ${a.vram.whole_gb} ${t("unit.gb")}${a.vram.measured_gb ? ` · ${a.vram.measured_gb} ${t("unit.gb")}` : ""}`)),
-        el("div", { class: "vbar" },
-          el("i", { class: "whole", style: { width: pct(a.vram.whole_gb) } }),
-          el("i", { style: { width: pct(a.vram.largest_phase_gb) } }),
-          a.vram.measured_gb ? el("b", { style: { left: pct(a.vram.measured_gb) } }) : null,
-          el("u", { style: { left: pct(24) }, title: "24 GB" })),
-        fit ? el("span", { class: `fit ${fit[1]}` }, t(fit[0])) : el("span"));
-    })));
-
-  return { node: page, active: "vram" };
 }

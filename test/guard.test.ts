@@ -37,7 +37,7 @@ test("runs are capped per UTC day and at the same time, and the count survives a
   assert.match(g.refuse(1)!, /1 at a time/);
   assert.equal(g.refuse(0), null);
   g.record();
-  assert.match(g.refuse(0)!, /2 runs for today/);
+  assert.match(g.refuse(0)!, /2 daily runs/);
   assert.deepEqual(JSON.parse(readFileSync(file, "utf-8")), { day: "2026-10-28", runs: 2 });
   const again = new Guard({ maxRunsPerDay: 2, stateFile: file, now: () => now });
   assert.equal(again.status(0).runs_left, 0);
@@ -68,7 +68,7 @@ test("requests from other sites are refused: rebound DNS names, cross-site write
   assert.equal(foreign(req("GET", {}), local), null);
   assert.equal(foreign(req("GET", { host: "localhost:3000" }), local), null);
   assert.equal(foreign(req("GET", { host: "[::1]:3000" }), local), null);
-  assert.equal(foreign(req("GET", { host: "studio.lan:3000" }), local), null, "FREEFIELD_ALLOWED_HOSTS");
+  assert.equal(foreign(req("GET", { host: "studio.lan:3000" }), local), null, "SPACIX_ALLOWED_HOSTS");
   assert.match(foreign(req("GET", { host: "evil.example:3000" }), local)!, /only answers to localhost/);
   // the web UI's own calls, from a current browser and from one without Sec-Fetch-Site
   assert.equal(foreign(req("POST", { "sec-fetch-site": "same-origin", origin: "http://127.0.0.1:3000" }), local), null);
@@ -110,9 +110,8 @@ test("plain http to a bare IP (a Vast.ai port) gets cookies without Secure; name
   assert.doesNotMatch(g.visitor(undefined, false).setCookie!, /Secure/);
 });
 
-test("the door of a pod or your own GPU says where its owner finds the passcode; the demo's stays as it was", () => {
-  assert.match(ownerDoor("RunPod"), /pod's log on RunPod/);
-  assert.match(ownerDoor("Vast.ai", "es-MX,es;q=0.9,en;q=0.8"), /lang="es".*log de la instancia en Vast\.ai.*>Abrir</s);
-  assert.match(ownerDoor("this computer", "en-US"), /launcher/);
-  assert.equal(ownerDoor("Modal"), DOOR_HTML);
+test("workspace passcode gate supports Spanish, workspace names, and default SPACIX branding", () => {
+  assert.match(ownerDoor("Studio Alpha"), /This SPACIX workspace \(Studio Alpha\) is private/);
+  assert.match(ownerDoor("Studio Alpha", "es-MX,es;q=0.9,en;q=0.8"), /lang="es".*Este espacio de SPACIX \(Studio Alpha\) es privado.*>Abrir</s);
+  assert.equal(ownerDoor(""), DOOR_HTML);
 });

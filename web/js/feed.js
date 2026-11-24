@@ -67,7 +67,7 @@ class Feed {
 export const feed = new Feed();
 
 export function statusText(e) {
-  if (e.status === "starting") return live.gpuWarm ? t("status.submitting") : t("status.starting");
+  if (e.status === "starting") return t("status.submitting");
   if (e.status === "queued") return e.queue ? t("status.queued.n", { n: e.queue }) : t("status.queued");
   if (e.status === "running") {
     const p = e.progress;
@@ -142,7 +142,7 @@ function failedCard(e) {
   const item = entryItem(e);
   const node = el("div", { class: "rcard failed" },
     el("b", {}, `${t(`status.${e.status}`)} · ${app?.name ?? e.app}`),
-    el("pre", {}, e.error?.class_type ? `${e.error.class_type}${e.error.node ? ` (node ${e.error.node})` : ""}: ${e.error.message}` : (e.error?.message || "")),
+    el("pre", {}, e.error?.message || ""),
     el("div", { class: "row" },
       app ? el("button", { class: "btn small lime", type: "button", onclick: () => hooks.retry?.(item) }, icon("redo"), t("act.retry")) : null,
       app ? el("button", { class: "btn small ghost", type: "button", onclick: () => hooks.recreate?.(item) }, t("act.recreate")) : null,
@@ -176,7 +176,7 @@ function doneCard(e, list) {
 
 /**
  * Draw the feed for one app (or all) into host and keep it current.
- * empty(): what to show when there is nothing yet. Returns a cleanup function.
+ * empty: a function returning a node, or a DOM Node, shown when there are no runs yet.
  */
 export function feedView(host, { app = null, empty = null, dense = false } = {}) {
   const grid = el("div", { class: `feed${dense ? " dense" : ""}` });
@@ -184,11 +184,16 @@ export function feedView(host, { app = null, empty = null, dense = false } = {})
   let lastOrder = null;
   const list = () => feed.list(app).filter((e) => e.status === "succeeded" && e.outputs.length);
   const kindOf = (e) => (!isDone(e) ? "pending" : e.status === "succeeded" && e.outputs.length ? "done" : "failed");
+  const resolveEmpty = () => {
+    if (typeof empty === "function") return empty();
+    if (empty instanceof Node) return empty;
+    return el("div", { class: "empty" }, t("ws.empty.hist"));
+  };
   const render = () => {
     const entries = feed.list(app);
     if (!entries.length && !feed.isLoaded(app)) return;   // first load still on its way: no flash of the empty state
     if (!entries.length) {
-      if (lastOrder !== "") host.replaceChildren(empty ? empty() : el("div", { class: "empty" }, t("ws.empty.hist")));
+      if (lastOrder !== "") host.replaceChildren(resolveEmpty());
       lastOrder = "";
       cards.clear();
       return;

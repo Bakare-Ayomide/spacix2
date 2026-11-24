@@ -1,103 +1,108 @@
-// Minimal HTTP API for the web UI. Node's built-in http plus the Fetch API types; no framework.
-//   GET    /api/apps                         catalog (what the UI needs to draw cards and forms)
-//   GET    /api/apps/:id/workflow            the app's ComfyUI workflow in API format, as a download (open it in ComfyUI)
-//   POST   /api/apps/:id/run                 multipart form: one field per input id, optional "preset"
-//                                            → 202 with the history entry; the run continues in the background
-//   GET    /api/history[?app=id]             every run started here, newest first (out/history/)
-//   GET    /api/history/:id                  one run, with live progress while it is going
-//   GET    /api/history/:id/files/:file      its inputs and outputs (byte ranges)
-//   GET    /api/history/:id/preview          the latest live preview frame, when the backend sends them
-//   POST   /api/history/:id/cancel           ask the backend to stop it
-//   DELETE /api/history/:id                  forget it (and its files)
-//   GET    /api/gpu[?device=1]               is the backend warm? (never wakes it; device=1 adds VRAM in use, only when warm)
-//   POST   /api/gpu/wake                     start the GPU container now, while you prepare inputs
-//   GET    /api/jobs/:id[/outputs/:oid]      raw SDK job view (kept for scripts; off on a hosted demo)
-//   GET    /api/flags                        lab examples marked "mediocre" from the UI (lab/flags.json)
-//   POST   /api/flags                        JSON { key, mediocre, note? }: mark or unmark one example
-// On a backend that downloads its own models (a pod, your own GPU), the Models panel (server/models.ts):
-//   GET    /api/models                       what each pack lacks and why, the download running now, the token's source
-//   POST   /api/models/download              JSON { packs }: download them (after the one running, if any)
-//   PUT    /api/models/token                 JSON { token }: keep a Hugging Face token on the backend (https only)
-//   DELETE /api/models/token                 forget it
-//   GET    /api/models/licenses[?repos=a,b]  which licenses that token can already read
-// On your own Windows PC (start.ps1 sets FREEFIELD_DESKTOP_ICON=1), the desktop icon (server/desktop.ts):
-//   POST   /api/desktop-icon                 JSON { want }: put an icon on the desktop or not (/api/gpu has the state)
-// Everything else is served from web/ when it exists (with byte ranges, so videos seek everywhere).
-// Hosted (server/guard.ts): FREEFIELD_PASSCODE closes every route behind a passcode, FREEFIELD_MAX_RUNS_PER_DAY and
-// FREEFIELD_MAX_ACTIVE cap the runs (429 past them), lab marks become read-only and uploads are capped at
-// FREEFIELD_MAX_UPLOAD_MB, and each visitor sees only their own runs. Hosted or not, requests from other sites are
-// refused (guard.ts foreign()). FREEFIELD_OUT moves out/ (history, the run count), FREEFIELD_HOST the listening address.
-// web/examples/ holds one example per app, written by lab/publish.py; /api/apps carries it along.
+// HTTP API and static asset server for SPACIX centrally managed multi-user AI SaaS platform.
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { createReadStream, existsSync, readFileSync, statSync } from "node:fs";
 import { extname, join, normalize, resolve } from "node:path";
 import { loadRegistry, repoRoot, isFileInput, type App } from "./registry.ts";
-import { explainSubmitError, InputError, resolveValues, Runner, type Values } from "./runner.ts";
-import { History, type JobLike } from "./history.ts";
+import { InputError, resolveValues, type Values } from "./runner.ts";
+import { History, type Entry } from "./history.ts";
 import { Flags } from "./flags.ts";
 import { DOOR_HTML, foreign, Guard, ownerDoor, plainHttpToIp } from "./guard.ts";
-import { needOf, refusal, type Downloads } from "./models.ts";
-import { DesktopIcon } from "./desktop.ts";
+import { compileGeneration } from "./providers/prompt-builder.ts";
+import { MySqlClient } from "./db/client.ts";
+import { PlatformService, sanitizeUserForClient } from "./modules/platform-service.ts";
+import { EmailService } from "./modules/email-service.ts";
+import {
+  AuthError,
+  AuthService,
+  buildSessionCookie,
+  clearSessionCookie,
+  clientIpFromReq,
+  userAgentFromReq,
+} from "./modules/auth-service.ts";
+import { ProviderManager } from "./modules/provider-manager.ts";
+import { AnalyticsService } from "./modules/analytics-service.ts";
+import { handleAdminRoutes } from "./routes/admin-routes.ts";
+import { hashPassword } from "./security/crypto.ts";
 
 const root = repoRoot();
 const { apps, problems } = loadRegistry(root);
-for (const p of problems.filter((x) => x.severity === "error")) console.error(`[registry] ${p.app}: ${p.message}`);
+for (const p of problems.filter((x) => x.severity === "error")) {
+  console.error(`[registry] ${p.app}: ${p.message}`);
+}
 const byId = new Map(apps.map((a) => [a.id, a]));
 
-// VRAM verdicts from tools/catalog.py (optional: the UI just shows less without it)
-type VramRow = { id: string; whole_gb: number; largest_phase_gb: number; verdict_24gb: string; measured_peak_gb: number | null };
-const vramFile = join(root, "docs", "vram-map.json");
-const vram = new Map<string, VramRow>(
-  existsSync(vramFile) ? (JSON.parse(readFileSync(vramFile, "utf-8")).apps as VramRow[]).map((r) => [r.id, r]) : [],
-);
-let runner: Runner | null = null;
-const getRunner = () => (runner ??= new Runner());
-const draftsAllowed = process.env.FREEFIELD_DRAFTS === "1";
-const outDir = process.env.FREEFIELD_OUT || join(root, "out");
+const draftsAllowed = (process.env.SPACIX_DRAFTS ?? process.env.FREEFIELD_DRAFTS) === "1";
+const outDir = process.env.SPACIX_OUT || process.env.FREEFIELD_OUT || join(root, "out");
 const guard = Guard.fromEnv(join(outDir, "limits.json"));
-const maxUploadMb = Number(process.env.FREEFIELD_MAX_UPLOAD_MB || (guard.hosted ? 100 : 0));
+const maxUploadMb = Number(process.env.SPACIX_MAX_UPLOAD_MB || process.env.FREEFIELD_MAX_UPLOAD_MB || (guard.hosted ? 100 : 0));
 const port = Number(process.env.PORT ?? 3000);
-const host = process.env.FREEFIELD_HOST || "0.0.0.0";
+const host = process.env.SPACIX_HOST || process.env.FREEFIELD_HOST || "0.0.0.0";
+const workspaceName = process.env.SPACIX_WORKSPACE_NAME?.trim() || "";
+const publicBaseUrl = process.env.PUBLIC_BASE_URL?.trim().replace(/\/$/, "") || "";
+
 const origins = {
   loopbackOnly: ["127.0.0.1", "localhost", "::1", "[::1]"].includes(host),
-  allowedHosts: (process.env.FREEFIELD_ALLOWED_HOSTS ?? "").split(",").map((h) => h.trim().toLowerCase()).filter(Boolean),
+  allowedHosts: (process.env.SPACIX_ALLOWED_HOSTS ?? process.env.FREEFIELD_ALLOWED_HOSTS ?? "")
+    .split(",")
+    .map((h) => h.trim().toLowerCase())
+    .filter(Boolean),
 };
 
-// the backend scales to zero 10 minutes after its last request (infra/modal_app.py scaledown_window).
-// lastContact only moves on real work (a run, a wake): status checks must not keep the GPU alive.
-const WARM_MS = 9 * 60 * 1000;
-// FREEFIELD_BACKEND_NAME: a backend that never sleeps (your own GPU, a pod on RunPod or Vast), shown by that name;
-// the GPU pill is always ready and says the pod costs money while it runs. Unset: Modal's scale-to-zero, as before.
-const alwaysOn = process.env.FREEFIELD_BACKEND_NAME?.trim() || "";
-const comfyBaseUrl = process.env.COMFY_BASE_URL?.trim() || "";
-const demoMode = !comfyBaseUrl || /your-workspace--|^https?:\/\/(example\.com|placeholder)/i.test(comfyBaseUrl);
-let lastContact = demoMode ? Date.now() : 0;
-let lastMockApp: string | null = null;
-let waking: { since: number; error?: string } | null = null;
-const contact = () => { lastContact = Date.now(); };
+const mysql = new MySqlClient();
+const platform = new PlatformService({ mysql, stateFilePath: join(outDir, "platform-state.json") });
+const emailService = new EmailService(platform);
+const authService = new AuthService(platform, emailService);
+const providerManager = new ProviderManager(platform);
+
 const history = new History(join(outDir, "history"), {
-  onContact: contact,
   appInfo: (id) => {
-    const app = apps.find((a) => a.id === id);
+    const app = byId.get(id);
     if (!app) return undefined;
-    const graph = app.graph ?? {};
-    return { outputs: app.outputs.map((o) => o.node), nodes: Object.keys(graph).length, classOf: (n) => graph[n]?.class_type ?? null };
+    return {
+      outputs: app.outputs.map((o) => o.node),
+      nodes: Object.keys(app.graph ?? {}).length,
+      classOf: (n) => app.graph?.[n]?.class_type ?? null,
+    };
   },
-  frames: demoMode ? undefined : (jobId, signal) => getRunner().frames(jobId, signal),
-  recheck: demoMode ? undefined : (jobId) => getRunner().jobs().get(jobId),
+  onUpdate: async (entry) => {
+    if (platform.isReady()) {
+      await platform.syncHistoryEntry(entry);
+    }
+  },
 });
+
+const analyticsService = new AnalyticsService({
+  platform,
+  providers: providerManager,
+  history,
+  mysql,
+});
+
 const flags = new Flags(join(root, "lab", "flags.json"), apps);
-const desktopIcon = DesktopIcon.fromEnv();
 
 const MIME: Record<string, string> = {
-  ".html": "text/html; charset=utf-8", ".js": "text/javascript; charset=utf-8", ".css": "text/css; charset=utf-8",
-  ".json": "application/json", ".txt": "text/plain; charset=utf-8", ".woff2": "font/woff2",
-  ".svg": "image/svg+xml", ".png": "image/png", ".webp": "image/webp", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
-  ".gif": "image/gif", ".mp4": "video/mp4", ".webm": "video/webm", ".mov": "video/quicktime",
-  ".mp3": "audio/mpeg", ".wav": "audio/wav", ".flac": "audio/flac", ".ogg": "audio/ogg", ".m4a": "audio/mp4",
+  ".html": "text/html; charset=utf-8",
+  ".js": "text/javascript; charset=utf-8",
+  ".css": "text/css; charset=utf-8",
+  ".json": "application/json",
+  ".txt": "text/plain; charset=utf-8",
+  ".woff2": "font/woff2",
+  ".svg": "image/svg+xml",
+  ".png": "image/png",
+  ".webp": "image/webp",
+  ".jpg": "image/jpeg",
+  ".jpeg": "image/jpeg",
+  ".gif": "image/gif",
+  ".mp4": "video/mp4",
+  ".webm": "video/webm",
+  ".mov": "video/quicktime",
+  ".mp3": "audio/mpeg",
+  ".wav": "audio/wav",
+  ".flac": "audio/flac",
+  ".ogg": "audio/ogg",
+  ".m4a": "audio/mp4",
 };
 
-// one example per app (lab/publish.py); read on every catalog request so a new publish shows up without a restart
 const examplesFile = join(root, "web", "examples", "index.json");
 function loadExamples(): Record<string, unknown> {
   try {
@@ -107,97 +112,15 @@ function loadExamples(): Record<string, unknown> {
   }
 }
 
-const runnable = (a: App) => Boolean(a.workflowPath) && (a.status === "ready" || draftsAllowed);
-
-/** The pack an app needs whose files the backend does not have, or null (see needOf for why they are missing). */
-function missingPack(a: App, files: Set<string> | null): string | null {
-  if (!files) return null;
-  const lacks = a.models.some((m) => !m.optional && !files.has(`${m.dir}/${m.file.split("/").pop()}`));
-  return lacks ? a.pack ?? "?" : null;
-}
-
-// infra/pod.py found a GPU this image cannot use: a card too old for CUDA 13, a driver older than it needs
-const gpuProblem = (() => {
-  try { return process.env.FREEFIELD_GPU_PROBLEM ? JSON.parse(process.env.FREEFIELD_GPU_PROBLEM) as Record<string, string> : null; }
-  catch { return null; }
-})();
-
-/** A call to the gateway with its token. Calls that ask Hugging Face (a token, the licenses) get longer. */
-function gateway(path: string, init: RequestInit = {}, timeoutMs = init.method && init.method !== "GET" ? 45_000 : 8000): Promise<Response> {
-  const base = process.env.COMFY_BASE_URL!.replace(/\/$/, "");
-  const auth: Record<string, string> = process.env.FREEFIELD_TOKEN ? { authorization: `Bearer ${process.env.FREEFIELD_TOKEN}` } : {};
-  return fetch(`${base}${path}`, { ...init, headers: { ...(init.headers as Record<string, string> ?? {}), ...auth },
-    signal: AbortSignal.timeout(timeoutMs) });
-}
-
-// Only known for a backend that is always on (a pod, your own GPU), which downloads its own models: a pod with
-// FREEFIELD_PACKS=image,upscale cannot run Face Swap. Modal is never asked, since asking would wake a GPU, and it has
-// every pack. Kept 30 s, 3 s while a download runs (the bar in the studio moves).
-type Backend = { at: number; files: Set<string> | null; downloads: Downloads | null };
-let backend: Backend = { at: 0, files: null, downloads: null };
-async function backendState(fresh = false): Promise<Backend> {
-  if (!alwaysOn || !process.env.COMFY_BASE_URL) return backend;
-  const moving = backend.downloads?.job?.state === "running" || Boolean(backend.downloads?.queued?.length);
-  if (!fresh && Date.now() - backend.at < (moving ? 3000 : 30_000)) return backend;
-  const [files, downloads] = await Promise.all([
-    gateway("/freefield/models").then(async (r) => {
-      if (!r.ok) return null;
-      const body = await r.json() as { folders?: Record<string, string[]> };
-      return new Set(Object.entries(body.folders ?? {}).flatMap(([dir, names]) => names.map((n) => `${dir}/${n.split(/[\\/]/).pop()}`)));
-    }).catch(() => null),   // an older gateway or ComfyUI still starting: nothing is marked
-    gateway("/freefield/downloads").then(async (r) => (r.ok ? await r.json() as Downloads : null)).catch(() => null),
-  ]);
-  backend = { at: Date.now(), files, downloads };
-  return backend;
-}
-
-/** What the Models panel shows: the gateway's view plus the apps of each pack and why each app waits. */
-async function modelsView(fresh = false) {
-  const { files, downloads } = await backendState(fresh);
-  const needs: Record<string, unknown> = {};
-  for (const a of apps) {
-    const n = needOf(a, files, downloads);
-    if (n) needs[a.id] = n;
-  }
-  const packApps: Record<string, string[]> = {};
-  for (const a of apps) (packApps[a.pack] ??= []).push(a.id);
-  return { available: Boolean(downloads?.enabled), ...(downloads ?? {}), needs, pack_apps: packApps,
-    gpu_problem: gpuProblem };
-}
-
-function publicApp(a: App, files: Set<string> | null = null, downloads: Downloads | null = null) {
-  return {
-    id: a.id, name: a.name, section: a.section, summary: a.summary ?? "", status: a.status, pack: a.pack,
-    runnable: runnable(a),
-    missing_pack: missingPack(a, files),
-    needs: needOf(a, files, downloads),
-    higgsfield_feature: a.higgsfield_feature ?? null,
-    modes: a.modes ?? null,
-    mode_label: a.mode_label ?? null,
-    inputs: a.inputs.map(({ bind: _bind, options, ...rest }) => ({
-      ...rest, ...(options ? { options: options.map(({ sets: _sets, ...o }) => o) } : {}),
-    })),
-    presets: (a.presets ?? []).map((p) => ({ id: p.id, label: p.label })),
-    outputs: a.outputs.map((o) => ({ type: o.type, label: o.label ?? null })),
-    models: a.models.map((m) => ({
-      name: m.file.split("/").pop(), repo: m.repo, gb: m.gb, license: m.license ?? null,
-      gated: Boolean(m.gated), optional: Boolean(m.optional), phase: m.phase,
-    })),
-    vram: vram.has(a.id) ? {
-      whole_gb: vram.get(a.id)!.whole_gb, largest_phase_gb: vram.get(a.id)!.largest_phase_gb,
-      verdict: vram.get(a.id)!.verdict_24gb, measured_gb: vram.get(a.id)!.measured_peak_gb,
-    } : null,
-    credits: a.credits ?? [],
-    notes: a.notes ?? null,
-  };
-}
-
-function send(res: ServerResponse, status: number, body: unknown) {
-  res.writeHead(status, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
+function send(res: ServerResponse, status: number, body: unknown, extraHeaders: Record<string, string | string[]> = {}) {
+  res.writeHead(status, {
+    "content-type": "application/json; charset=utf-8",
+    "cache-control": "no-store",
+    ...extraHeaders,
+  });
   res.end(JSON.stringify(body));
 }
 
-/** A file from disk, honouring Range so <video> can seek. */
 function sendFile(req: IncomingMessage, res: ServerResponse, file: string, cache = "no-cache") {
   const size = statSync(file).size;
   const type = MIME[extname(file).toLowerCase()] ?? "application/octet-stream";
@@ -209,8 +132,13 @@ function sendFile(req: IncomingMessage, res: ServerResponse, file: string, cache
       res.writeHead(416, { "content-range": `bytes */${size}` });
       return res.end();
     }
-    res.writeHead(206, { "content-type": type, "content-length": end - start + 1, "content-range": `bytes ${start}-${end}/${size}`,
-      "accept-ranges": "bytes", "cache-control": cache });
+    res.writeHead(206, {
+      "content-type": type,
+      "content-length": end - start + 1,
+      "content-range": `bytes ${start}-${end}/${size}`,
+      "accept-ranges": "bytes",
+      "cache-control": cache,
+    });
     return createReadStream(file, { start, end }).pipe(res);
   }
   res.writeHead(200, { "content-type": type, "content-length": size, "accept-ranges": "bytes", "cache-control": cache });
@@ -218,22 +146,40 @@ function sendFile(req: IncomingMessage, res: ServerResponse, file: string, cache
   return createReadStream(file).pipe(res);
 }
 
-async function toRequest(req: IncomingMessage): Promise<Request> {
+async function readRawBody(req: IncomingMessage, limitBytes: number): Promise<Buffer> {
   const chunks: Buffer[] = [];
   let size = 0;
   for await (const c of req) {
     size += (c as Buffer).byteLength;
-    if (maxUploadMb && size > maxUploadMb * 2 ** 20) throw new InputError(`uploads are limited to ${maxUploadMb} MB here`);
+    if (limitBytes && size > limitBytes) {
+      throw new InputError(`Request body exceeds ${Math.round(limitBytes / 2 ** 20)} MB limit`);
+    }
     chunks.push(c as Buffer);
   }
+  return Buffer.concat(chunks);
+}
+
+async function toRequest(req: IncomingMessage): Promise<Request> {
+  const body = await readRawBody(req, maxUploadMb ? maxUploadMb * 2 ** 20 : 128 * 2 ** 20);
   return new Request(`http://local${req.url}`, {
     method: req.method,
     headers: req.headers as Record<string, string>,
-    body: chunks.length ? Buffer.concat(chunks) : undefined,
+    body: body.byteLength ? new Uint8Array(body) : undefined,
   });
 }
 
-async function readValues(app: App, request: Request): Promise<{ values: Values; preset?: string }> {
+async function readJsonBody(req: IncomingMessage): Promise<Record<string, unknown>> {
+  const raw = await readRawBody(req, 2 * 2 ** 20);
+  if (!raw.byteLength) return {};
+  try {
+    const parsed = JSON.parse(raw.toString("utf-8"));
+    return parsed && typeof parsed === "object" ? (parsed as Record<string, unknown>) : {};
+  } catch {
+    throw new InputError("Invalid JSON request body.");
+  }
+}
+
+async function readValues(app: App, request: Request): Promise<{ values: Values; preset?: string; projectId?: string; modelId?: string }> {
   const form = await request.formData();
   const values: Values = {};
   for (const input of app.inputs) {
@@ -247,358 +193,586 @@ async function readValues(app: App, request: Request): Promise<{ values: Values;
     }
   }
   const preset = form.get("preset");
-  return { values, preset: typeof preset === "string" && preset ? preset : undefined };
-}
-
-async function jobView(id: string) {
-  const job = await getRunner().jobs().get(id);
+  const projectId = form.get("project_id");
+  const modelId = form.get("model_id");
   return {
-    id: job.id,
-    status: job.status,
-    error: job.error ?? null,
-    outputs: job.outputs.map((o) => ({ id: o.id, node: o.nodeId, name: o.name, type: o.type, url: `/api/jobs/${job.id}/outputs/${o.id}` })),
+    values,
+    preset: typeof preset === "string" && preset ? preset : undefined,
+    projectId: typeof projectId === "string" && projectId ? projectId : undefined,
+    modelId: typeof modelId === "string" && modelId ? modelId : undefined,
   };
-}
-
-// Minimal 1x1 dark lime PNG fallback when an app has no published lab example on disk
-const FALLBACK_PNG = Buffer.from(
-  "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==",
-  "base64",
-);
-
-function createMockJob(app: App): JobLike {
-  const jobId = `demo-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
-  const examples = loadExamples() as Record<string, { full?: string; card?: string; type?: string }>;
-  const ex = examples[app.id];
-  const primaryOut = app.outputs[0] ?? { node: "out", type: "image" as const };
-  let samplePath: string | null = null;
-  if (ex?.full) {
-    const candidate = join(root, "web", ex.full);
-    if (existsSync(candidate) && statSync(candidate).isFile()) samplePath = candidate;
-  }
-  const outExt = samplePath ? extname(samplePath).toLowerCase() : ".png";
-  const outType = samplePath ? (ex?.type ?? primaryOut.type) : "image";
-  const outMime = MIME[outExt] ?? "image/png";
-
-  let status = "queued";
-  let startedAt: Date | null = null;
-  let completedAt: Date | null = null;
-  let canceled = false;
-  let progress: JobLike["progress"] = { value: 0, step: null, steps: null, currentNodeClass: null };
-  let outputs: JobLike["outputs"] = [];
-
-  const totalSteps = 8;
-  const totalNodes = Math.max(1, Object.keys(app.graph ?? {}).length);
-  const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
-  let resolveDone!: () => void;
-  const donePromise = new Promise<void>((r) => { resolveDone = r; });
-
-  const listeners = new Set<(ev: unknown) => void>();
-  const push = (ev: unknown) => { for (const fn of listeners) fn(ev); };
-
-  void (async () => {
-    await sleep(250);
-    if (canceled) {
-      status = "canceled";
-      completedAt = new Date();
-      resolveDone();
-      return;
-    }
-    status = "running";
-    startedAt = new Date();
-    lastMockApp = app.id;
-    push({ kind: "statusChange", status: "running", queuePosition: null });
-    for (let step = 1; step <= totalSteps; step++) {
-      await sleep(280);
-      if (canceled) {
-        status = "canceled";
-        completedAt = new Date();
-        resolveDone();
-        return;
-      }
-      const frac = step / totalSteps;
-      progress = { value: Math.min(0.98, frac), step, steps: totalSteps, currentNodeClass: "KSampler" };
-      push({
-        kind: "progress",
-        nodesDone: Math.floor(frac * totalNodes),
-        nodesTotal: totalNodes,
-        step,
-        steps: totalSteps,
-        currentNode: null,
-        currentNodeClass: "KSampler",
-      });
-    }
-    outputs = [{
-      name: `${app.id}${outExt}`,
-      type: outType,
-      nodeId: primaryOut.node,
-      contentType: outMime,
-      toBytes: async () => new Uint8Array(samplePath ? readFileSync(samplePath) : FALLBACK_PNG),
-    }];
-    status = "succeeded";
-    completedAt = new Date();
-    resolveDone();
-  })();
-
-  return {
-    get id() { return jobId; },
-    get status() { return status; },
-    get outputs() { return outputs; },
-    get error() { return null; },
-    get startedAt() { return startedAt; },
-    get completedAt() { return completedAt; },
-    get progress() { return progress; },
-    get queuePosition() { return status === "queued" ? 1 : null; },
-    async *events(signal?: AbortSignal) {
-      const queue: unknown[] = [];
-      let wakeIter: (() => void) | null = null;
-      const onEv = (ev: unknown) => { queue.push(ev); wakeIter?.(); wakeIter = null; };
-      listeners.add(onEv);
-      const onDone = () => { wakeIter?.(); wakeIter = null; };
-      void donePromise.then(onDone);
-      signal?.addEventListener("abort", onDone, { once: true });
-      try {
-        while (!signal?.aborted) {
-          while (queue.length) yield queue.shift() as never;
-          if (status === "succeeded" || status === "canceled" || status === "failed") break;
-          await new Promise<void>((r) => { wakeIter = r; });
-        }
-      } finally {
-        listeners.delete(onEv);
-        signal?.removeEventListener("abort", onDone);
-      }
-    },
-    async wait() { await donePromise; },
-    async cancel() { canceled = true; },
-  };
-}
-
-/** Submit in the background; the entry tells the UI how it goes. */
-function startRun(app: App, values: Values, preset?: string, owner?: string) {
-  const entry = history.start(app, values, preset, owner);
-  void (async () => {
-    try {
-      const job = demoMode ? createMockJob(app) : await getRunner().submit(app, values, preset);
-      contact();
-      await history.follow(entry, job);
-    } catch (e) {
-      const explained = explainSubmitError(app, e);
-      const message = explained ?? (e as Error).message ?? String(e);
-      console.error(`[${app.id}] ${message}`);
-      history.fail(entry, message);
-    }
-  })();
-  return history.view(entry);
 }
 
 const DONE = ["succeeded", "failed", "canceled", "expired", "lost"];
-// runs accepted whose upload is still being read count too, so two requests at once cannot both pass FREEFIELD_MAX_ACTIVE
 let admitting = 0;
-const activeRuns = () => history.list(undefined, 50).filter((e) => !DONE.includes(e.status)).length + admitting;
+const activeRuns = () => history.list(undefined, 200).filter((e) => !DONE.includes(e.status)).length + admitting;
 
-let gpuCache: { at: number; body: unknown } | null = null;
-async function gpuStatus(withDevice = false) {
-  const running = activeRuns();
-  if (demoMode) {
-    return {
-      configured: true,
-      host: "Preview Simulator (No ComfyUI required)",
-      warm: true,
-      always_on: true,
-      problem: null,
-      desktop_icon: desktopIcon.state(),
-      last_contact: lastContact ? new Date(lastContact).toISOString() : null,
-      waking: null,
-      running,
-      demo: guard.hosted ? guard.status(running) : null,
-      device: withDevice ? { app: lastMockApp, name: "Simulated GPU (24 GB)", vram_total_gb: 24, vram_used_gb: running ? 14.2 : 6.4 } : null,
-    };
+async function startManagedRun(args: {
+  app: App;
+  values: Values;
+  preset?: string;
+  ownerId?: string;
+  authenticatedUserId: string | null;
+  projectId?: string | null;
+  modelIdOverride?: string | null;
+}) {
+  const { app, values, preset, ownerId, authenticatedUserId, projectId, modelIdOverride } = args;
+  const userRecord = authenticatedUserId ? await platform.store.getUserById(authenticatedUserId) : null;
+
+  if (app.status !== "ready" && !draftsAllowed && !userRecord?.is_admin) {
+    throw new InputError(`${app.name} is currently unavailable.`);
   }
-  const configured = Boolean(process.env.COMFY_BASE_URL);
-  const host = configured ? (alwaysOn || (guard.hosted ? "Modal" : new URL(process.env.COMFY_BASE_URL!).host)) : null;
-  const warm = Boolean(alwaysOn && configured) || Date.now() - lastContact < WARM_MS;
-  const base = { configured, host, warm, always_on: Boolean(alwaysOn), problem: gpuProblem, desktop_icon: desktopIcon.state(),
-    last_contact: lastContact ? new Date(lastContact).toISOString() : null,
-    waking: waking ? { seconds: Math.round((Date.now() - waking.since) / 1000), error: waking.error ?? null } : null,
-    running, demo: guard.hosted ? guard.status(running) : null };
-  // only on request and only while warm: looking never starts a GPU, and the background poll never touches it
-  if (!withDevice || !warm || !configured) return { ...base, device: null };
-  if (gpuCache && Date.now() - gpuCache.at < 5000) return { ...base, device: gpuCache.body };
-  let device: unknown = null;
-  try {
-    const r = getRunner();
-    const res = await fetch(`${r.baseUrl}/freefield/status`, {
-      headers: r.token ? { authorization: `Bearer ${r.token}` } : {}, signal: AbortSignal.timeout(4000),
-    });
-    if (res.ok) {
-      const s = (await res.json()) as { app?: string; comfyui?: { devices?: { name?: string; vram_total?: number; vram_free?: number }[] } };
-      const d = s.comfyui?.devices?.[0];
-      device = { app: s.app ?? null, name: d?.name ?? null,
-        vram_total_gb: d?.vram_total ? +(d.vram_total / 2 ** 30).toFixed(1) : null,
-        vram_used_gb: d?.vram_total && d.vram_free !== undefined ? +((d.vram_total - d.vram_free) / 2 ** 30).toFixed(1) : null };
+
+  const exec = await platform.resolveAppExecution(app, userRecord, modelIdOverride);
+  if (!exec.allowed || !exec.providerId || !exec.endpoint) {
+    throw new InputError(exec.reason || `${app.name} is temporarily unavailable.`);
+  }
+
+  const provHealth = await providerManager.isProviderReady(exec.providerId);
+  if (!provHealth.ready) {
+    throw Object.assign(new Error("AI generation service is temporarily unavailable. Please try again later."), { httpStatus: 503 });
+  }
+
+  const billingEnabled = await platform.isFlagEnabled("credit_billing_enabled", true);
+  const requireVerify = await platform.isFlagEnabled("require_email_verification", false);
+
+  if (authenticatedUserId && userRecord) {
+    if (requireVerify && !userRecord.email_verified && !userRecord.is_admin) {
+      throw Object.assign(new AuthError("Please verify your email address before generating.", 403), { httpStatus: 403 });
     }
-  } catch { /* status is best effort */ }
-  gpuCache = { at: Date.now(), body: device };
-  return { ...base, device };
+    if (userRecord.subscription_plan_id) {
+      const plans = await platform.store.listPlans(false);
+      const plan = plans.find((p) => p.id === userRecord.subscription_plan_id);
+      if (plan) {
+        const userActive = history.list(undefined, 200, ownerId).filter((e) => !DONE.includes(e.status)).length;
+        if (userActive >= plan.max_active_jobs) {
+          throw Object.assign(new Error(`Plan limit reached (${plan.max_active_jobs} concurrent generations allowed).`), { httpStatus: 429 });
+        }
+        if (plan.max_daily_runs !== null) {
+          const dayAgo = Date.now() - 86_400_000;
+          const dailyCount = history.list(undefined, 500, ownerId).filter((e) => new Date(e.created).getTime() >= dayAgo).length;
+          if (dailyCount >= plan.max_daily_runs) {
+            throw Object.assign(new Error(`Daily plan limit reached (${plan.max_daily_runs} generations/day).`), { httpStatus: 429 });
+          }
+        }
+      }
+    }
+  } else if (billingEnabled && exec.creditCost > 0) {
+    throw new AuthError("Please sign in or create an account to generate.", 401);
+  }
+
+  const compiled = compileGeneration(app, values, preset);
+  const entry = history.start(app, values, preset, ownerId, {
+    provider: exec.providerId,
+    provider_endpoint: exec.endpoint,
+    project_id: projectId ?? null,
+  });
+
+  let debitedCredits = 0;
+  if (billingEnabled && exec.creditCost > 0 && authenticatedUserId) {
+    try {
+      await platform.store.adjustCredits({
+        userId: authenticatedUserId,
+        delta: -exec.creditCost,
+        txType: "usage",
+        reason: `Generation: ${app.name}`,
+        generationId: entry.id,
+        referenceId: `gen_debit_${entry.id}`,
+      });
+      debitedCredits = exec.creditCost;
+    } catch (err) {
+      history.remove(entry.id);
+      throw Object.assign(new Error((err as Error).message || "Insufficient credit balance."), { httpStatus: 402 });
+    }
+  }
+
+  await platform.syncHistoryEntry(entry, {
+    userId: authenticatedUserId ?? undefined,
+    modelId: exec.modelId,
+    creditsCharged: debitedCredits,
+  }).catch(() => {});
+
+  void (async () => {
+    try {
+      const submitted = await providerManager.submitWithFallback({
+        app,
+        binding: {
+          supported: true,
+          provider: exec.providerId,
+          endpoint: exec.endpoint,
+          modelName: exec.modelName,
+          capability: exec.capability as never,
+          unavailableReason: null,
+        },
+        compiled,
+        webhookBaseUrl: publicBaseUrl || undefined,
+      });
+      const finished = await history.follow(entry, submitted.job);
+      if (finished.status !== "succeeded" && debitedCredits > 0 && authenticatedUserId) {
+        await platform.store.adjustCredits({
+          userId: authenticatedUserId,
+          delta: debitedCredits,
+          txType: "refund",
+          reason: `Automatic refund for failed run (${app.name})`,
+          generationId: entry.id,
+          referenceId: `gen_refund_${entry.id}`,
+        }).catch(() => {});
+      }
+      await platform.syncHistoryEntry(finished, {
+        userId: authenticatedUserId ?? undefined,
+        modelId: exec.modelId,
+        creditsCharged: finished.status === "succeeded" ? debitedCredits : 0,
+      }).catch(() => {});
+    } catch (e) {
+      const message = (e as Error).message ?? String(e);
+      console.error(`[${app.id}] ${message}`);
+      history.fail(entry, message);
+      if (debitedCredits > 0 && authenticatedUserId) {
+        await platform.store.adjustCredits({
+          userId: authenticatedUserId,
+          delta: debitedCredits,
+          txType: "refund",
+          reason: `Automatic refund for failed submission (${app.name})`,
+          generationId: entry.id,
+          referenceId: `gen_refund_${entry.id}`,
+        }).catch(() => {});
+      }
+    }
+  })();
+
+  return history.view(entry);
 }
 
-function wake() {
-  if (demoMode) {
-    contact();
-    waking = null;
-    return;
+const readyPromise = (async () => {
+  await platform.init(apps);
+  // Optionally auto-seed initial admin from environment when zero admins exist
+  if ((await platform.store.countAdmins()) === 0 && process.env.SPACIX_ADMIN_EMAIL && process.env.SPACIX_ADMIN_PASSWORD) {
+    try {
+      const created = await platform.store.createUser({
+        email: process.env.SPACIX_ADMIN_EMAIL.trim().toLowerCase(),
+        passwordHash: hashPassword(process.env.SPACIX_ADMIN_PASSWORD),
+        displayName: process.env.SPACIX_ADMIN_NAME || "Platform Super Admin",
+        isAdmin: true,
+        emailVerified: true,
+        roles: ["super_admin"],
+        initialCredits: 1000,
+        planId: "plan_studio",
+      });
+      console.log(`[auth] Provisioned Super Admin ${created.email} from environment`);
+    } catch (err) {
+      console.warn(`[auth] Failed provisioning admin from env: ${(err as Error).message}`);
+    }
   }
-  if (waking && !waking.error) return;
-  const r = getRunner();   // throws without COMFY_BASE_URL: the caller answers 400
-  waking = { since: Date.now() };
-  const started = waking;
-  fetch(`${r.baseUrl}/health`, { signal: AbortSignal.timeout(15 * 60 * 1000) })
-    .then((res) => {
-      if (!res.ok) throw new Error(`/health answered ${res.status}`);
-      contact();
-      if (waking === started) waking = null;
-    })
-    .catch((e) => { if (waking === started) waking = { ...started, error: (e as Error).message }; });
-}
+  console.log(`[platform] store initialized (${platform.engine}) with ${apps.length} studio apps`);
+})();
 
 const server = createServer(async (req, res) => {
   try {
+    await readyPromise;
+
     const url = new URL(req.url ?? "/", "http://local");
     const parts = url.pathname.split("/").filter(Boolean).map(decodeURIComponent);
+    const isSecureCookie = !plainHttpToIp(req);
+
+    // Webhooks use cryptographic signature verification
+    if (req.method === "POST" && parts[0] === "api" && parts[1] === "webhooks" && parts[2] === "fal") {
+      const rawBody = await readRawBody(req, 5 * 2 ** 20);
+      const fal = await providerManager.getFalProvider();
+      const update = await fal.parseWebhook({ headers: req.headers, rawBody });
+      if (update) {
+        const updated = await history.applyWebhookUpdate(update);
+        if (updated) await platform.syncHistoryEntry(updated).catch(() => {});
+      }
+      return send(res, 200, { ok: true });
+    }
+
     const refusedOrigin = foreign(req, origins);
     if (refusedOrigin) return send(res, 403, { error: refusedOrigin });
+
     if (guard.passcode) {
       const key = url.searchParams.get("key");
-      const cookie = key !== null ? guard.login(key, !plainHttpToIp(req)) : null;
-      if (cookie) {   // the passcode leaves the address bar and lives on as a cookie
+      const cookie = key !== null ? guard.login(key, isSecureCookie) : null;
+      if (cookie) {
         url.searchParams.delete("key");
         res.writeHead(303, { "set-cookie": cookie, location: url.pathname + url.search, "cache-control": "no-store" });
         return res.end();
       }
       if (!guard.admits(req.headers.cookie)) {
-        if (parts[0] === "api") return send(res, 401, { error: "this demo needs its passcode: open the link you were given" });
+        if (parts[0] === "api") return send(res, 401, { error: "Workspace passcode required" });
         res.writeHead(401, { "content-type": "text/html; charset=utf-8", "cache-control": "no-store" });
-        return res.end(alwaysOn ? ownerDoor(alwaysOn, String(req.headers["accept-language"] ?? "")) : DOOR_HTML);
+        return res.end(workspaceName ? ownerDoor(workspaceName, String(req.headers["accept-language"] ?? "")) : DOOR_HTML);
       }
     }
-    const visitor = guard.visitor(req.headers.cookie, !plainHttpToIp(req));   // hosted: this browser's id; locally undefined (no filter)
+
+    const visitor = guard.visitor(req.headers.cookie, isSecureCookie);
     if (visitor.setCookie) res.setHeader("set-cookie", visitor.setCookie);
-    const me = visitor.id;
-    if (req.method === "GET" && url.pathname === "/health") {
-      return send(res, 200, { ok: true, apps: apps.length, mode: demoMode ? "demo" : "live" });
+
+    const authSession = await authService.resolveRequestUser(req);
+    const sessionUser = authSession?.user ?? null;
+    const ownerScope = sessionUser ? sessionUser.id : visitor.id;
+
+    if (req.method === "GET" && (url.pathname === "/health" || url.pathname === "/api/health")) {
+      return send(res, 200, {
+        ok: true,
+        apps: apps.length,
+        engine: platform.engine,
+      });
     }
+
     if (parts[0] === "api") {
       const [, area, id, sub, arg] = parts;
-      if (req.method === "GET" && area === "health" && parts.length === 2) {
-        return send(res, 200, { ok: true, apps: apps.length, mode: demoMode ? "demo" : "live" });
+
+      // ---------------------------------------------------------------- Public Bootstrap & Announcements
+      if (area === "bootstrap" && req.method === "GET") {
+        return send(res, 200, await platform.getPublicBootstrap(sessionUser));
       }
+
+      if (area === "announcements" && id === "active" && req.method === "GET") {
+        return send(res, 200, { announcements: await platform.store.listAnnouncements(true) });
+      }
+
+      if (area === "plans" && req.method === "GET") {
+        return send(res, 200, { plans: await platform.store.listPlans(true) });
+      }
+
+      // ---------------------------------------------------------------- Authentication Routes
+      if (area === "auth") {
+        if (id === "me" && req.method === "GET") {
+          return send(res, 200, {
+            user: sessionUser ? sanitizeUserForClient(sessionUser) : null,
+            needs_admin_bootstrap: (await platform.store.countAdmins()) === 0,
+          });
+        }
+
+        if (id === "register" && req.method === "POST") {
+          const body = await readJsonBody(req);
+          const result = await authService.register({
+            email: String(body.email || ""),
+            password: String(body.password || ""),
+            displayName: String(body.display_name || ""),
+            ipAddress: clientIpFromReq(req),
+            userAgent: userAgentFromReq(req),
+          });
+          return send(
+            res,
+            201,
+            {
+              user: sanitizeUserForClient(result.user),
+              token: result.token,
+              verification_required: !result.user.email_verified,
+            },
+            { "set-cookie": buildSessionCookie(result.token, result.ttlSeconds, isSecureCookie) },
+          );
+        }
+
+        if (id === "login" && req.method === "POST") {
+          const body = await readJsonBody(req);
+          const result = await authService.login({
+            email: String(body.email || ""),
+            password: String(body.password || ""),
+            adminPortal: Boolean(body.admin_portal),
+            ipAddress: clientIpFromReq(req),
+            userAgent: userAgentFromReq(req),
+          });
+          return send(
+            res,
+            200,
+            { user: sanitizeUserForClient(result.user), token: result.token },
+            { "set-cookie": buildSessionCookie(result.token, result.ttlSeconds, isSecureCookie) },
+          );
+        }
+
+        if (id === "bootstrap-admin" && req.method === "POST") {
+          const body = await readJsonBody(req);
+          const result = await authService.bootstrapSuperAdmin({
+            email: String(body.email || ""),
+            password: String(body.password || ""),
+            displayName: String(body.display_name || "Platform Super Admin"),
+            ipAddress: clientIpFromReq(req),
+            userAgent: userAgentFromReq(req),
+          });
+          return send(
+            res,
+            201,
+            { user: sanitizeUserForClient(result.user), token: result.token },
+            { "set-cookie": buildSessionCookie(result.token, result.ttlSeconds, isSecureCookie) },
+          );
+        }
+
+        if (id === "logout" && req.method === "POST") {
+          await authService.logout(req);
+          return send(res, 200, { ok: true }, { "set-cookie": clearSessionCookie(isSecureCookie) });
+        }
+
+        if (id === "verify-email" && req.method === "POST") {
+          const body = await readJsonBody(req);
+          const verified = await authService.verifyEmail(String(body.token || ""));
+          return send(res, 200, { user: sanitizeUserForClient(verified) });
+        }
+
+        if (id === "request-reset" && req.method === "POST") {
+          const body = await readJsonBody(req);
+          await authService.requestPasswordReset(String(body.email || ""));
+          return send(res, 200, { ok: true, message: "If an account exists for that email, a reset link has been dispatched." });
+        }
+
+        if (id === "reset-password" && req.method === "POST") {
+          const body = await readJsonBody(req);
+          const user = await authService.resetPassword(String(body.token || ""), String(body.password || ""));
+          return send(res, 200, { ok: true, user: sanitizeUserForClient(user) });
+        }
+      }
+
+      // ---------------------------------------------------------------- Authenticated User Account Routes
+      if (area === "account") {
+        if (!sessionUser) return send(res, 401, { error: "Sign in required." });
+        if (id === "profile" && (req.method === "PATCH" || req.method === "PUT")) {
+          const body = await readJsonBody(req);
+          const updated = await platform.store.updateUser(sessionUser.id, {
+            displayName: typeof body.display_name === "string" ? body.display_name.slice(0, 120) : undefined,
+            profile: {
+              ...(typeof body.company === "string" ? { company: body.company.slice(0, 160) } : {}),
+              ...(typeof body.bio === "string" ? { bio: body.bio.slice(0, 500) } : {}),
+              ...(typeof body.locale === "string" ? { locale: body.locale.slice(0, 16) } : {}),
+              ...(typeof body.timezone === "string" ? { timezone: body.timezone.slice(0, 64) } : {}),
+            },
+          });
+          return send(res, 200, { user: updated ? sanitizeUserForClient(updated) : null });
+        }
+        if (id === "password" && req.method === "POST") {
+          const body = await readJsonBody(req);
+          const updated = await authService.login({
+            email: sessionUser.email || "",
+            password: String(body.current_password || ""),
+            ipAddress: clientIpFromReq(req),
+            userAgent: userAgentFromReq(req),
+          });
+          if (updated) {
+            const newPass = String(body.new_password || "");
+            if (newPass.length < 8) throw new AuthError("New password must be at least 8 characters.", 400);
+            await platform.store.updateUser(sessionUser.id, { passwordHash: hashPassword(newPass) });
+          }
+          return send(res, 200, { ok: true });
+        }
+      }
+
+      if (area === "notifications") {
+        if (!sessionUser) return send(res, 200, { notifications: [], unread: 0 });
+        if (req.method === "GET" && !id) {
+          const list = await platform.store.listUserNotifications(sessionUser.id, 50);
+          return send(res, 200, { notifications: list, unread: list.filter((n) => !n.read_at).length });
+        }
+        if (req.method === "POST" && id === "read") {
+          const body = await readJsonBody(req);
+          await platform.store.markNotificationRead(sessionUser.id, body.id ? String(body.id) : undefined);
+          return send(res, 200, { ok: true });
+        }
+      }
+
+      if (area === "projects") {
+        if (!sessionUser) return send(res, 200, { projects: [] });
+        if (req.method === "GET") {
+          return send(res, 200, { projects: await platform.store.listProjects(sessionUser.id) });
+        }
+        if (req.method === "POST") {
+          const body = await readJsonBody(req);
+          if (typeof body.name !== "string" || !body.name.trim()) throw new InputError("Project name is required.");
+          const created = await platform.store.createProject(sessionUser.id, body.name, typeof body.description === "string" ? body.description : "");
+          return send(res, 201, created);
+        }
+      }
+
+      if (area === "credits" && req.method === "GET") {
+        if (!sessionUser) return send(res, 200, { balance: 0, lifetime_granted: 0, lifetime_spent: 0, transactions: [] });
+        return send(res, 200, await platform.store.getCreditSummary(sessionUser.id));
+      }
+
+      // ---------------------------------------------------------------- Admin Control Centre Routes (/api/admin/*)
+      if (area === "admin") {
+        if (!sessionUser || !sessionUser.is_admin) {
+          return send(res, sessionUser ? 403 : 401, {
+            error: sessionUser ? "Administrator access required." : "Sign in with an administrator account.",
+          });
+        }
+        const handled = await handleAdminRoutes(req, res, url, parts, sessionUser, {
+          platform,
+          auth: authService,
+          providers: providerManager,
+          email: emailService,
+          analytics: analyticsService,
+          history,
+          apps,
+          readJsonBody,
+          send,
+          retryRun: async (genId, admin) => {
+            const gen = await platform.store.getGeneration(genId);
+            const histEntry = history.get(genId);
+            const appId = gen?.app_id ?? histEntry?.app;
+            const app = appId ? byId.get(appId) : undefined;
+            if (!app) throw new InputError("Original application for this generation was not found.");
+            const vals = (gen?.settings ?? histEntry?.values ?? {}) as Values;
+            return startManagedRun({
+              app,
+              values: vals,
+              preset: gen?.preset_id ?? histEntry?.preset ?? undefined,
+              ownerId: gen?.user_id ?? admin.id,
+              authenticatedUserId: gen?.user_id ?? admin.id,
+            });
+          },
+        });
+        if (handled) return;
+      }
+
+      // ---------------------------------------------------------------- Studio Apps Catalog (Sanitized for Regular Users)
       if (req.method === "GET" && area === "apps" && parts.length === 2) {
         const order = { image: 0, video: 1, audio: 2, utility: 3 } as Record<string, number>;
-        const sorted = [...apps].sort((a, b) => order[a.section] - order[b.section]
-          || Number(b.status === "ready") - Number(a.status === "ready") || a.name.localeCompare(b.name));
+        const sorted = [...apps].sort(
+          (a, b) => order[a.section] - order[b.section] || Number(b.status === "ready") - Number(a.status === "ready") || a.name.localeCompare(b.name),
+        );
         const examples = loadExamples();
-        const { files, downloads } = await backendState();
-        return send(res, 200, { apps: sorted.map((a) => ({ ...publicApp(a, files, downloads), example: examples[a.id] ?? null })), drafts: draftsAllowed,
-          hosted: guard.hosted, models_panel: Boolean(downloads?.enabled) });
+        const studioApps = await platform.store.listStudioApps();
+        const studioMap = new Map(studioApps.map((s) => [s.id, s]));
+        const allModels = await platform.store.listModels();
+        const modelMap = new Map(allModels.map((m) => [m.id, m]));
+        const providersList = await providerManager.listAdminProviders();
+        const provReadyMap = new Map(providersList.map((p) => [p.id, p.runtime_available]));
+
+        const visibleApps = [];
+        for (const a of sorted) {
+          const studioCfg = studioMap.get(a.id);
+          if (studioCfg && !studioCfg.published && !sessionUser?.is_admin) continue;
+
+          const exec = await platform.resolveAppExecution(a, sessionUser);
+          const providerReady = exec.providerId ? Boolean(provReadyMap.get(exec.providerId)) : false;
+          const runnable = exec.allowed && providerReady && (a.status === "ready" || draftsAllowed || Boolean(sessionUser?.is_admin));
+
+          const assignedModels = (studioCfg?.model_ids ?? [])
+            .map((mid) => modelMap.get(mid))
+            .filter((m): m is NonNullable<typeof m> => Boolean(m && m.enabled))
+            .map((m) => ({ id: m.id, name: m.display_name, credit_price: m.credit_price, category: m.category }));
+
+          visibleApps.push({
+            id: a.id,
+            name: studioCfg?.name || a.name,
+            section: a.section,
+            summary: studioCfg?.summary ?? a.summary ?? "",
+            thumbnail_url: studioCfg?.thumbnail_url ?? null,
+            status: a.status,
+            pack: a.pack,
+            credit_cost: exec.creditCost,
+            runnable,
+            // Sanitized availability only — no API keys, server endpoints, or infra paths exposed
+            availability: {
+              supported: Boolean(exec.providerId && exec.endpoint),
+              available: runnable,
+              capability: exec.capability,
+              modelName: exec.modelName,
+              reason: !exec.allowed
+                ? exec.reason
+                : !providerReady
+                  ? "Service is temporarily unavailable."
+                  : null,
+            },
+            available_models: assignedModels,
+            modes: a.modes ?? null,
+            mode_label: a.mode_label ?? null,
+            inputs: a.inputs.map(({ bind: _bind, options, ...rest }) => ({
+              ...rest,
+              ...(options ? { options: options.map(({ sets: _sets, ...o }) => o) } : {}),
+            })),
+            presets: studioCfg?.presets_override ?? (a.presets ?? []).map((p) => ({ id: p.id, label: p.label })),
+            outputs: a.outputs.map((o) => ({ type: o.type, label: o.label ?? null })),
+            models: a.models.map((m) => ({
+              name: m.file.split("/").pop(),
+              license: m.license ?? null,
+              optional: Boolean(m.optional),
+              phase: m.phase,
+            })),
+            credits: a.credits ?? [],
+            notes: a.notes ?? null,
+            example: examples[a.id] ?? null,
+          });
+        }
+        return send(res, 200, {
+          apps: visibleApps,
+          drafts: draftsAllowed,
+          hosted: guard.hosted,
+        });
       }
-      if (req.method === "GET" && area === "apps" && sub === "workflow") {
-        // the app's ComfyUI workflow (API format) as a file: drag it onto ComfyUI's canvas to open the app as nodes
-        const app = byId.get(id);
-        if (!app?.workflowPath) return send(res, 404, { error: "no workflow" });
-        const body = readFileSync(app.workflowPath);
-        res.writeHead(200, { "content-type": "application/json; charset=utf-8", "content-length": body.byteLength, "cache-control": "no-cache",
-          "content-disposition": `attachment; filename="spacix-${app.id}.json"` });
-        return res.end(body);
-      }
+
+      // ---------------------------------------------------------------- Run Generation
       if (req.method === "POST" && area === "apps" && sub === "run") {
         const app = byId.get(id);
-        if (!app) return send(res, 404, { error: "unknown app" });
-        if (!app.workflowPath) throw new InputError(`${app.id} has no workflow yet`);
-        if (!runnable(app)) throw new InputError(`${app.id} is a draft; start the server with FREEFIELD_DRAFTS=1 to run it anyway`);
-        const { files, downloads } = await backendState();
-        const need = needOf(app, files, downloads);
-        if (need) throw new InputError(refusal(app.id, need));
+        if (!app) return send(res, 404, { error: "Unknown app" });
         const refused = guard.refuse(activeRuns());
         if (refused) return send(res, 429, { error: refused });
+
         admitting++;
         let view;
         try {
-          const { values, preset } = await readValues(app, await toRequest(req));
-          view = startRun(app, resolveValues(app, values), preset, me);
+          const parsed = await readValues(app, await toRequest(req));
+          const resolved = resolveValues(app, parsed.values);
+          const proj = parsed.projectId ?? url.searchParams.get("project_id");
+          view = await startManagedRun({
+            app,
+            values: resolved,
+            preset: parsed.preset,
+            ownerId: ownerScope,
+            authenticatedUserId: sessionUser?.id ?? null,
+            projectId: proj,
+            modelIdOverride: parsed.modelId,
+          });
         } finally {
           admitting--;
         }
         guard.record();
         return send(res, 202, view);
       }
+
+      // ---------------------------------------------------------------- History Feed & Media
       if (area === "history") {
-        if (req.method === "GET" && !id) return send(res, 200, { entries: history.list(url.searchParams.get("app") || undefined, 300, me) });
+        const effectiveOwner = sessionUser?.is_admin && url.searchParams.get("scope") === "all" ? undefined : ownerScope;
+        if (req.method === "GET" && !id) {
+          const appFilter = url.searchParams.get("app") || undefined;
+          let entries = history.list(appFilter, 300, effectiveOwner);
+          // Backfill local-owner legacy entries if authenticated admin asks for personal feed and has none yet
+          if (!entries.length && sessionUser?.is_admin) {
+            entries = history.list(appFilter, 300);
+          }
+          return send(res, 200, { entries });
+        }
         if (req.method === "GET" && id && !sub) {
-          const e = history.get(id, me);
-          return e ? send(res, 200, e) : send(res, 404, { error: "unknown run" });
+          const e = history.get(id, sessionUser?.is_admin ? undefined : ownerScope);
+          return e ? send(res, 200, e) : send(res, 404, { error: "Unknown run" });
         }
         if ((req.method === "GET" || req.method === "HEAD") && sub === "files" && arg) {
-          const file = history.file(id, arg, me);
-          return file ? sendFile(req, res, file, "private, max-age=31536000, immutable") : send(res, 404, { error: "not found" });
+          const file = history.file(id, arg, sessionUser?.is_admin ? undefined : ownerScope);
+          return file ? sendFile(req, res, file, "private, max-age=31536000, immutable") : send(res, 404, { error: "Not found" });
         }
         if (req.method === "GET" && sub === "preview") {
-          const p = history.preview(id, me);
-          if (!p) return send(res, 404, { error: "no preview" });
+          const p = history.preview(id, sessionUser?.is_admin ? undefined : ownerScope);
+          if (!p) return send(res, 404, { error: "No preview" });
           res.writeHead(200, { "content-type": p.type, "content-length": p.bytes.byteLength, "cache-control": "no-store" });
           return res.end(p.bytes);
         }
-        if (req.method === "POST" && sub === "cancel") return send(res, 200, { canceled: await history.cancel(id, me) });
-        if (req.method === "DELETE" && id && !sub) return send(res, history.remove(id, me) ? 200 : 404, { removed: id });
-      }
-      if (area === "gpu") {
-        if (req.method === "GET" && !id) return send(res, 200, await gpuStatus(url.searchParams.get("device") === "1"));
-        if (req.method === "POST" && id === "wake") {
-          try { wake(); } catch (e) { throw new InputError((e as Error).message); }
-          return send(res, 202, await gpuStatus());
+        if (req.method === "POST" && sub === "cancel") {
+          return send(res, 200, { canceled: await history.cancel(id, sessionUser?.is_admin ? undefined : ownerScope) });
+        }
+        if (req.method === "DELETE" && id && !sub) {
+          const ok = history.remove(id, sessionUser?.is_admin ? undefined : ownerScope);
+          if (ok) await platform.store.deleteGenerationRecord(id).catch(() => {});
+          return send(res, ok ? 200 : 404, { removed: id });
         }
       }
-      if (area === "models") {
-        // only where the backend downloads its own models: never on Modal (always-on is unset there), so the hosted
-        // demo neither shows nor takes a Hugging Face token
-        if (!alwaysOn || !process.env.COMFY_BASE_URL) return send(res, 404, { error: "this backend does not download its own models" });
-        const relay = async (r: Response) => {
-          const body = await r.json().catch(() => ({ error: `the gateway answered ${r.status}` }));
-          if (r.status === 404) return send(res, 501, { error: "this backend's gateway is older than the Models panel: update it" });
-          await backendState(true);
-          return send(res, r.status, body);
-        };
-        if (req.method === "GET" && !id) return send(res, 200, await modelsView(url.searchParams.get("fresh") === "1"));
-        if (req.method === "GET" && id === "licenses") {
-          return relay(await gateway(`/freefield/licenses?repos=${encodeURIComponent(url.searchParams.get("repos") ?? "")}`, {}, 45_000));
-        }
-        if (req.method === "POST" && id === "download") {
-          const body = await (await toRequest(req)).json().catch(() => null) as { packs?: unknown } | null;
-          if (!body || !Array.isArray(body.packs) || !body.packs.every((p) => typeof p === "string")) throw new InputError('expected JSON { "packs": [...] }');
-          return relay(await gateway("/freefield/downloads", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ packs: body.packs }) }));
-        }
-        if (id === "token" && req.method === "PUT") {
-          // a token is a password to the owner's Hugging Face account: not over plain http to a bare IP (a Vast.ai port)
-          if (plainHttpToIp(req)) {
-            return send(res, 400, { error: "open SPACIX through its https link to paste a token (it is in the log, the line with trycloudflare.com): over plain http, anyone on the way could read it" });
-          }
-          const body = await (await toRequest(req)).json().catch(() => null) as { token?: unknown } | null;
-          if (!body || typeof body.token !== "string") throw new InputError('expected JSON { "token": "hf_..." }');
-          return relay(await gateway("/freefield/hf-token", { method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify({ token: body.token }) }));
-        }
-        if (id === "token" && req.method === "DELETE") return relay(await gateway("/freefield/hf-token", { method: "DELETE" }));
-      }
-      if (area === "desktop-icon" && req.method === "POST" && parts.length === 2) {
-        const body = await (await toRequest(req)).json().catch(() => null) as { want?: unknown } | null;
-        if (!body || typeof body.want !== "boolean") throw new InputError("expected JSON { want: true | false }");
-        const state = desktopIcon.answer(body.want);
-        return state ? send(res, 200, { desktop_icon: state }) : send(res, 404, { error: "no launcher here to make a desktop icon" });
-      }
+
       if (area === "flags" && parts.length === 2) {
         if (req.method === "GET") return send(res, 200, { mediocre: flags.list() });
         if (req.method === "POST") {
-          if (guard.hosted) return send(res, 403, { error: "lab marks are read-only on the hosted demo" });
-          const body = await (await toRequest(req)).json().catch(() => null) as { key?: unknown; mediocre?: unknown; note?: unknown } | null;
-          if (!body || typeof body.key !== "string" || typeof body.mediocre !== "boolean") throw new InputError("expected JSON { key, mediocre, note? }");
+          if (guard.hosted && !sessionUser?.is_admin) return send(res, 403, { error: "Lab marks are read-only in hosted mode" });
+          const body = await readJsonBody(req);
+          if (typeof body.key !== "string" || typeof body.mediocre !== "boolean") {
+            throw new InputError("Expected JSON { key, mediocre, note? }");
+          }
           try {
             return send(res, 200, { mediocre: flags.set(body.key, body.mediocre, typeof body.note === "string" ? body.note : undefined) });
           } catch (e) {
@@ -606,22 +780,11 @@ const server = createServer(async (req, res) => {
           }
         }
       }
-      // the raw job view reaches any backend job by id, past the history's per-visitor view: local scripts only
-      if (area === "jobs" && guard.hosted) return send(res, 404, { error: "not found" });
-      if (req.method === "GET" && area === "jobs" && parts.length === 3) {
-        return send(res, 200, await jobView(id));
-      }
-      if (req.method === "GET" && area === "jobs" && sub === "outputs" && arg) {
-        const job = await getRunner().jobs().get(id);
-        const out = job.outputs.find((o) => o.id === arg);
-        if (!out) return send(res, 404, { error: "unknown output" });
-        const bytes = await out.toBytes();
-        res.writeHead(200, { "content-type": out.contentType || "application/octet-stream", "content-length": bytes.byteLength });
-        return res.end(bytes);
-      }
-      return send(res, 404, { error: "not found" });
+
+      return send(res, 404, { error: "Not found" });
     }
-    // static apps/ (so /apps/<id>/app.json and workflows can be fetched directly)
+
+    // Static apps/ manifests
     if (parts[0] === "apps" && (req.method === "GET" || req.method === "HEAD")) {
       const appsRoot = resolve(root, "apps");
       const relApp = normalize(parts.slice(1).join("/")).replace(/^(\.\.[/\\])+/, "");
@@ -629,23 +792,38 @@ const server = createServer(async (req, res) => {
       if (appFile.startsWith(appsRoot + "/") && existsSync(appFile) && statSync(appFile).isFile()) {
         return sendFile(req, res, appFile);
       }
-      return send(res, 404, { error: "not found" });
+      return send(res, 404, { error: "Not found" });
     }
-    // static web/
+
+    // Static web/
     const webRoot = resolve(root, "web");
     const rel = normalize(url.pathname === "/" ? "index.html" : decodeURIComponent(url.pathname.slice(1))).replace(/^(\.\.[/\\])+/, "");
     const file = resolve(webRoot, rel);
-    if ((file === webRoot || file.startsWith(webRoot + "/")) && existsSync(file) && statSync(file).isFile()) return sendFile(req, res, file);
-    return send(res, 404, { error: "not found" });
+    if ((file === webRoot || file.startsWith(webRoot + "/")) && existsSync(file) && statSync(file).isFile()) {
+      return sendFile(req, res, file);
+    }
+    return send(res, 404, { error: "Not found" });
   } catch (e) {
-    const status = e instanceof InputError ? 400 : 500;
+    const errObj = e as Error & { httpStatus?: number };
+    const status = e instanceof InputError ? 400 : e instanceof AuthError ? e.httpStatus : (errObj.httpStatus ?? 500);
     if (status === 500) console.error(e);
-    return send(res, status, { error: (e as Error).message });
+    return send(res, status, { error: errObj.message });
   }
 });
 
-// runs that were still going when the server stopped are followed again
-if (!demoMode) history.resume(async (jobId) => getRunner().jobs().get(jobId));
+readyPromise.then(() => {
+  history.resume(async (jobId, entry: Entry) => {
+    if (!entry.provider || !entry.provider_endpoint) {
+      throw new Error("Missing provider metadata for resuming run");
+    }
+    return providerManager.getJobForResume(entry.provider, jobId, entry.provider_endpoint);
+  });
+});
 
-server.listen(port, host, () => console.log(`spacix on http://${host}:${port} (${apps.length} apps${demoMode ? " · preview mode" : ""})`
-  + (guard.passcode ? " · passcode required" : "") + (guard.maxRunsPerDay ? ` · ${guard.maxRunsPerDay} runs a day` : "")));
+server.listen(port, host, () => {
+  console.log(
+    `spacix on http://${host}:${port} (${apps.length} apps)` +
+      (guard.passcode ? " · passcode required" : "") +
+      (guard.maxRunsPerDay ? ` · ${guard.maxRunsPerDay} runs/day` : ""),
+  );
+});

@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { ComfyEvent } from "@comfyorg/sdk";
+import type { JobEvent } from "../server/providers/types.ts";
 import { loadRegistry } from "../server/registry.ts";
 import { resolveValues } from "../server/runner.ts";
 import { History, Meter, pickOutputs, type JobLike } from "../server/history.ts";
@@ -14,7 +14,7 @@ const byId = (id: string) => apps.find((a) => a.id === id)!;
 const PNG = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 1, 2, 3]);
 
 /** A job that runs through queued → running → its end state when wait() is called. */
-function fakeJob(end: "succeeded" | "failed", events: ComfyEvent[] = []): JobLike & { canceled: boolean } {
+function fakeJob(end: "succeeded" | "failed", events: JobEvent[] = []): JobLike & { canceled: boolean } {
   let status = "queued";
   const started = new Date();
   return {
@@ -64,7 +64,7 @@ test("following a job stores its media outputs and timings", async () => {
   try {
     const app = byId("z-image");
     const entry = history.start(app, resolveValues(app, { prompt: "a fox" }));
-    const progress: ComfyEvent = { kind: "progress", value: 0.5, message: null, nodesDone: 1, nodesTotal: 3, currentNode: "3",
+    const progress: JobEvent = { kind: "progress", value: 0.5, nodesDone: 1, nodesTotal: 3, currentNode: "3",
       currentNodeClass: "KSampler", step: 4, steps: 8 };
     const done1 = await history.follow(entry, fakeJob("succeeded", [progress]));
     assert.equal(done1.status, "succeeded");
@@ -152,9 +152,9 @@ test("a submit that never reached the backend is marked failed with the reason",
   try {
     const app = byId("z-image");
     const entry = history.start(app, resolveValues(app, { prompt: "x" }));
-    history.fail(entry, "Set COMFY_BASE_URL to the gateway URL");
+    history.fail(entry, "Set FAL_KEY on the server");
     assert.equal(history.get(entry.id)!.status, "failed");
-    assert.equal(history.get(entry.id)!.error!.message, "Set COMFY_BASE_URL to the gateway URL");
+    assert.equal(history.get(entry.id)!.error!.message, "Set FAL_KEY on the server");
   } finally { done(); }
 });
 
@@ -274,4 +274,48 @@ test("a job called expired the moment it ends gets a second look before the run 
     const still = await gone.follow(gone.start(app, resolveValues(app, { prompt: "a fox" })), racy);
     assert.equal(still.status, "expired", "a job that stays expired is expired");
   } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("webhook update resolves an active entry and stores downloaded outputs", async () => {
+  const { dir, history, done } = tempHistory();
+  try {
+    const app = byId("z-image");
+    const entry = history.start(app, resolveValues(app, { prompt: "a fox" }), undefined, undefined, {
+      provider: "fal",
+      provider_endpoint: "fal-ai/flux/schnell",
+    });
+    const pendingJob: JobLike = {
+      id: "req-webhook-1",
+      status: "queued",
+      outputs: [],
+      error: null,
+      startedAt: null,
+      completedAt: null,
+      async *events() {},
+      async wait() { await new Promise((r) => setTimeout(r, 200)); },
+      async cancel() {},
+    };
+    const following = history.follow(entry, pendingJob);
+    await new Promise((r) => setTimeout(r, 20));
+    const updated = await history.applyWebhookUpdate({
+      externalJobId: "req-webhook-1",
+      status: "succeeded",
+      outputs: [{
+        id: "image-0",
+        name: "fox.png",
+        type: "image",
+        nodeId: "out",
+        contentType: "image/png",
+        url: "https://v3.fal.media/files/fox.png",
+        toBytes: async () => PNG,
+      }],
+    });
+    assert.ok(updated);
+    assert.equal(updated.status, "succeeded");
+    assert.equal(updated.outputs[0].file, "out-01.png");
+    assert.equal(updated.outputs[0].url, "https://v3.fal.media/files/fox.png");
+    assert.ok(existsSync(join(dir, entry.id, "out-01.png")));
+    const finalEntry = await following;
+    assert.equal(finalEntry.status, "succeeded");
+  } finally { done(); }
 });

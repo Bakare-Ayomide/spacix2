@@ -1,5 +1,5 @@
 {
   "name": "SPACIX",
-  "description": "Open-source ComfyUI creative studio: every app is one folder, every model is open weights.",
+  "description": "SPACIX cloud AI creative studio: multi-provider generation for image, video, and audio.",
   "requestFramePermissions": []
 }
